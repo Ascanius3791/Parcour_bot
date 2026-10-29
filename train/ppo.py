@@ -163,7 +163,7 @@ class PPO:
                     kl = (torch.log(dist.stddev / std_o)
                           + (std_o ** 2 + (mu_o - dist.mean) ** 2) / (2 * dist.stddev ** 2) - 0.5).sum(-1).mean()
                     if kl > 2 * self.desired_kl:
-                        self.lr = max(1e-5, self.lr / 1.5)
+                        self.lr = max(1e-6, self.lr / 1.5)
                     elif 0 < kl < self.desired_kl / 2:
                         self.lr = min(1e-2, self.lr * 1.5)
                     for g in self.opt.param_groups:

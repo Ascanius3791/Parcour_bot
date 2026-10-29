@@ -73,7 +73,7 @@ class Trainer:
 
         self.env = self.make_env()
         self.segments = self.env.obs_segments
-        self.model = ActorCritic(self.segments, self.env.act_size, init_std=0.2)
+        self.model = ActorCritic(self.segments, self.env.act_size, init_std=0.1)
         self.ppo = PPO(self.model)
         self.obs_norm = RunningNorm(self.env.obs_size)
         self.rew_scale = RewardScaler(args.envs, self.ppo.gamma)
