@@ -10,6 +10,7 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
 
 option(PARCOUR_BUILD_VIEWER "Build the GLFW viewer" ON)
+option(PARCOUR_BUILD_PYTHON "Build the Python module used for training" ON)
 
 # --- MuJoCo (prebuilt release, fetched by scripts/setup_deps.sh) -------------------------
 set(MUJOCO_VERSION 3.17.0)
@@ -31,14 +32,33 @@ add_library(parcour_core
   src/core/simulation.cpp
   src/core/course.cpp
   src/core/perception.cpp
-  src/core/parkour_env.cpp)
+  src/core/parkour_env.cpp
+  src/core/vec_env.cpp
+  src/core/policy.cpp)
 target_include_directories(parcour_core PUBLIC src)
 target_link_libraries(parcour_core PUBLIC mujoco)
+set_target_properties(parcour_core PROPERTIES POSITION_INDEPENDENT_CODE ON)  # linked into the Python module
 target_compile_options(parcour_core PRIVATE -Wall -Wextra)
 target_compile_definitions(parcour_core PUBLIC PARCOUR_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
 
 add_executable(parcour_selftest apps/selftest.cpp)
 target_link_libraries(parcour_selftest PRIVATE parcour_core)
+
+# --- Python module (import parcour) for the PPO trainer in train/ ------------------------
+if(PARCOUR_BUILD_PYTHON)
+  find_package(Python 3.8 COMPONENTS Interpreter Development.Module)
+  if(Python_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(pybind11
+      URL https://github.com/pybind/pybind11/archive/refs/tags/v2.13.6.tar.gz
+      URL_HASH SHA256=e08cb87f4773da97fa7b5f035de8763abc656d87d5773e62f6da0587d1f0ec20)
+    FetchContent_MakeAvailable(pybind11)
+    pybind11_add_module(parcour python/bindings.cpp)
+    target_link_libraries(parcour PRIVATE parcour_core)
+  else()
+    message(WARNING "Python development files not found: the training module is not built")
+  endif()
+endif()
 
 # --- viewer -----------------------------------------------------------------------------
 if(PARCOUR_BUILD_VIEWER)

@@ -36,6 +36,7 @@ struct CourseParams {
   int num_obstacles = 6;
   double width = 2.4;        // corridor width (m)
   double max_turn_deg = 25;  // max heading change between sections
+  double finish_length = 4;  // length of the finish runway (long + no obstacles = a track)
   // obstacle types that may appear (kFloor is ignored)
   bool allowed[kNumObstacleTypes] = {false, true, true, true, true, true, true};
 };

@@ -1,0 +1,119 @@
+# PPO training on GitHub's runners, in rounds of up to ~5.5 h (the job limit is 6 h).
+#
+# Each round runs `members` trainings in parallel, all continuing from the newest checkpoint
+# with different random seeds, keeps the best one as the artifact "checkpoint" and then starts
+# the next round, until `rounds` is used up. Stop early by cancelling the running round.
+# Start: Actions tab -> train -> Run workflow, or `gh workflow run train.yml -f rounds=4`.
+# Watch: scripts/fetch_checkpoint.sh && build/parcour_viewer --policy runs/latest/policy.bin
+name: train
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "rounds to run back to back (each up to ~5.5 h)"
+        default: "4"
+      members:
+        description: "parallel trainings per round (the best one is kept)"
+        default: "3"
+      minutes:
+        description: "training minutes per round"
+        default: "315"
+      stage:
+        description: "force a stage (stand / walk / run); empty = continue"
+        default: ""
+      fresh:
+        description: "start from scratch instead of the newest checkpoint"
+        type: boolean
+        default: false
+
+concurrency:
+  group: training
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write  # read the previous checkpoint, start the next round
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      members: ${{ steps.m.outputs.members }}
+    steps:
+      - id: m
+        run: python3 -c "import json; print('members=' + json.dumps(list(range(max(1, int('${{ inputs.members }}'))))))" >> "$GITHUB_OUTPUT"
+
+  train:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        member: ${{ fromJSON(needs.plan.outputs.members) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-torch-2.7.1-cpu-py311
+      - name: Install PyTorch (CPU)
+        run: |
+          pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy
+      - name: Fetch MuJoCo
+        run: scripts/setup_deps.sh
+      - name: Build the simulation module
+        run: |
+          cmake -S . -B build -G "Unix Makefiles" -DPARCOUR_BUILD_VIEWER=OFF -DPython_EXECUTABLE="$(which python)"
+          cmake --build build -j --target parcour
+      - name: Previous checkpoint
+        id: prev
+        if: ${{ !inputs.fresh }}
+        run: |
+          if scripts/fetch_checkpoint.sh prev; then echo "resume=--resume prev" >> "$GITHUB_OUTPUT"; fi
+      - name: Train
+        run: |
+          python train/train.py --minutes ${{ inputs.minutes }} --out out \
+            --seed ${{ github.run_id }}${{ matrix.member }} ${{ steps.prev.outputs.resume }} \
+            ${{ inputs.stage != '' && format('--stage {0}', inputs.stage) || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: member-${{ matrix.member }}
+          path: out/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  select:
+    needs: train
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: member-*
+          path: members
+      - name: Keep the best run
+        run: |
+          python3 train/select_best.py members checkpoint
+          cat checkpoint/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint
+          path: checkpoint/
+          retention-days: 90
+      - name: Start the next round
+        if: ${{ fromJSON(inputs.rounds) > 1 }}
+        run: |
+          gh workflow run train.yml --ref "${{ github.ref_name }}" \
+            -f rounds=$(( ${{ inputs.rounds }} - 1 )) -f members=${{ inputs.members }} \
+            -f minutes=${{ inputs.minutes }} -f fresh=false

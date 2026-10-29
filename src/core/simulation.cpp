@@ -65,11 +65,24 @@ bool Simulation::substep() {
 }
 
 bool Simulation::step(const double* action) {
-  layout_->apply_action(m_, d_, action);
+  if (action_mode == ActionMode::kTorque) {
+    layout_->apply_action(m_, d_, action);
+    for (int k = 0; k < frame_skip; ++k) {
+      if (!substep()) return false;
+    }
+    return true;
+  }
+  action_.assign(action, action + m_->nu);
   for (int k = 0; k < frame_skip; ++k) {
+    layout_->apply_pd_action(m_, d_, action_.data());
     if (!substep()) return false;
   }
   return true;
+}
+
+void Simulation::forward() {
+  mj_forward(m_, d_);
+  state_time_ = -1;
 }
 
 const BodyState& Simulation::body_state() {

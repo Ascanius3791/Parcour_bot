@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <string>
 #include <thread>
@@ -13,7 +14,9 @@
 
 #include "core/controllers.h"
 #include "core/parkour_env.h"
+#include "core/policy.h"
 #include "core/simulation.h"
+#include "core/vec_env.h"
 
 using namespace parcour;
 
@@ -468,6 +471,116 @@ void test_perception() {
   check(upcoming_obstacles(c, c.finish_s, 3).empty(), "no obstacles listed after the last one");
 }
 
+// Flat track, as used by the first training stages.
+EnvConfig track_config() {
+  EnvConfig cfg;
+  cfg.course.num_obstacles = 0;
+  cfg.course.finish_length = 20;
+  cfg.stall_time = 1e9;
+  return cfg;
+}
+
+void test_training_interface(int threads) {
+  std::puts("training interface");
+  {
+    EnvConfig cfg = track_config();
+    cfg.down_height = 0.6;
+    ParkourEnv env(cfg);
+    std::vector<double> zero(env.sim().model()->nu, 0.0);
+    bool done = false;
+    for (int t = 0; t < 150 && !done; ++t) done = env.step(zero.data()).done;
+    const double z = env.sim().body_state().com.z;
+    check(!done && z > 0.85, "target control, action 0 = keep standing for 3 s",
+          fmt("(com %.2f m, ", z) + end_reason_name(env.end_reason()) + ")");
+    check(std::fabs(env.height_above_ground() - z) < 1e-6, "height above ground on the runway",
+          fmt("(%.3f m)", env.height_above_ground()));
+
+    cfg.action_mode = ActionMode::kTorque;  // zero torque: the body collapses
+    ParkourEnv limp(cfg);
+    EndReason r = EndReason::kNone;
+    for (int t = 0; t < 150 && r == EndReason::kNone; ++t) r = limp.step(zero.data()).reason;
+    check(r == EndReason::kDown, "collapsing ends the run as 'fell over'", end_reason_name(r));
+  }
+  {
+    EnvConfig cfg = track_config();
+    cfg.init_noise = 0.1;
+    ParkourEnv env(cfg);
+    const mjModel* m = env.sim().model();
+    const auto& joints = env.sim().layout().actuated_joints;
+    std::vector<double> a, b;
+    for (int j : joints) a.push_back(env.sim().data()->qpos[m->jnt_qposadr[j]]);
+    env.reset();
+    bool in_range = true;
+    double max_dev = 0;
+    for (int j : joints) {
+      const double q = env.sim().data()->qpos[m->jnt_qposadr[j]];
+      b.push_back(q);
+      in_range &= q >= m->jnt_range[2 * j] - 1e-9 && q <= m->jnt_range[2 * j + 1] + 1e-9;
+      max_dev = std::max(max_dev, std::fabs(q));
+    }
+    check(a != b && in_range && max_dev <= 0.1 + 1e-9, "start pose noise: random, within limits",
+          fmt("(max %.3f rad)", max_dev));
+  }
+  {
+    // the batch gives the same results on any number of threads
+    EnvConfig cfg = track_config();
+    cfg.time_limit = 0.5;  // many episode ends
+    cfg.init_noise = 0.05;
+    const int n = 6, steps = 60;
+    VecEnv one(cfg, n, 1), many(cfg, n, std::max(2, threads));
+    const int no = one.obs_size(), na = one.act_size();
+    std::vector<float> o1(n * no), o2(n * no), f1(n * no), f2(n * no), r1(n), r2(n), act(n * na);
+    std::vector<uint8_t> d1(n), d2(n), t1(n), t2(n);
+    one.reset(o1.data());
+    many.reset(o2.data());
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> u(-0.5f, 0.5f);
+    bool same = o1 == o2, final_ok = true;
+    int ends = 0, truncs = 0;
+    for (int t = 0; t < steps; ++t) {
+      for (float& x : act) x = u(rng);
+      one.step(act.data(), o1.data(), r1.data(), d1.data(), t1.data(), f1.data());
+      many.step(act.data(), o2.data(), r2.data(), d2.data(), t2.data(), f2.data());
+      same &= o1 == o2 && r1 == r2 && d1 == d2 && t1 == t2;
+      for (int i = 0; i < n; ++i) {
+        if (!d1[i]) continue;
+        ++ends;
+        truncs += t1[i];
+        // the final observation belongs to the old episode, obs to the new one
+        final_ok &= !std::equal(&f1[i * no], &f1[(i + 1) * no], &o1[i * no]);
+        final_ok &= std::equal(&f1[i * no], &f1[(i + 1) * no], &f2[i * no]);
+      }
+    }
+    const std::vector<EpisodeStats> eps = one.take_episodes();
+    check(same, "batch of envs: same results on 1 and on several threads");
+    check(ends > 0 && int(eps.size()) == ends && truncs > 0, "episodes restart and are reported",
+          fmt("(%.0f ends, %.0f by time limit)", ends, truncs));
+    check(final_ok, "final observation of an ended episode is returned separately");
+    check(one.take_episodes().empty(), "episode reports are handed out once");
+  }
+  {
+    // policy file: 3 inputs -> 2 hidden (elu) -> 2 actions
+    const std::string path = "/tmp/parcour_selftest_policy.bin";
+    {
+      std::ofstream f(path, std::ios::binary);
+      f << "parcour_policy 1\nlayers 3 2 2\nactivation elu\nobs_clip 10\nstage test\nend\n";
+      const float data[] = {1, 2, 3,    1, 1, 2,             // mean, std
+                            1, 0, 0,    0, 1, -1,   0, 0,    // W0, b0
+                            1, 0,   0.5, 0.5,       0, 0.1}; // W1, b1
+      f.write(reinterpret_cast<const char*>(data), sizeof(data));
+    }
+    Policy p(path);
+    double a[2];
+    p.act({3, 2, 3}, a);  // normalised (2, 0, 0) -> hidden (2, 0) -> (2, 1.1) -> clamped
+    const bool ok1 = std::fabs(a[0] - 1) < 1e-6 && std::fabs(a[1] - 1) < 1e-6;
+    p.act({1, 2, 5}, a);  // normalised (0, 0, 1) -> hidden (0, elu(-1)) -> (0, 0.1 + 0.5 elu(-1))
+    const bool ok2 = std::fabs(a[0]) < 1e-6 && std::fabs(a[1] - (0.1 + 0.5 * std::expm1(-1.0))) < 1e-6;
+    check(ok1 && ok2 && p.meta().at("stage") == "test" && p.obs_size() == 3 && p.act_size() == 2,
+          "policy file: normalisation, layers, elu, clamping, meta data");
+    std::remove(path.c_str());
+  }
+}
+
 void benchmark(int threads) {
   std::puts("benchmark (random actions + full observation on generated courses, new course every 8 episodes)");
   auto run = [&](int nthreads) {
@@ -501,6 +614,23 @@ void benchmark(int threads) {
   };
   run(1);
   if (threads > 1) run(threads);
+  {
+    EnvConfig cfg;
+    VecEnv vec(cfg, 64, threads);
+    const int n = vec.num_envs(), steps = 40;
+    std::vector<float> obs(n * vec.obs_size()), fin(obs.size()), rew(n), act(n * vec.act_size());
+    std::vector<uint8_t> done(n), trunc(n);
+    std::mt19937 rng(3);
+    std::uniform_real_distribution<float> u(-0.3f, 0.3f);
+    vec.reset(obs.data());
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int t = 0; t < steps; ++t) {
+      for (float& x : act) x = u(rng);
+      vec.step(act.data(), obs.data(), rew.data(), done.data(), trunc.data(), fin.data());
+    }
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("  VecEnv, 64 envs on %d thread(s): %8.0f control steps/s\n", vec.threads(), n * steps / sec);
+  }
 }
 }  // namespace
 
@@ -521,6 +651,7 @@ int main(int argc, char** argv) {
   test_course_generation();
   test_course_physics();
   test_perception();
+  test_training_interface(threads);
   benchmark(threads);
   std::printf("%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures,
               failures == 1 ? "" : "s");

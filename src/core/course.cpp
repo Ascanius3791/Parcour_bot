@@ -301,7 +301,7 @@ Course generate_course(const CourseParams& params) {
     const int k = int(i);
     const double approach = r.uniform(1.2, 2.0), runout = r.uniform(1.2, 2.0);
     switch (order[i]) {
-      case Obstacle::kFloor: make_runway(c, k, i == 0 ? 3.0 : 4.0); break;
+      case Obstacle::kFloor: make_runway(c, k, i == 0 ? 3.0 : std::max(params.finish_length, 4.0)); break;
       case Obstacle::kStairs: make_stairs(c, k, r, d, approach, runout); break;
       case Obstacle::kHurdle: make_hurdle(c, k, r, d, approach, runout); break;
       case Obstacle::kWall: make_wall(c, k, r, d, approach, runout); break;
@@ -315,7 +315,7 @@ Course generate_course(const CourseParams& params) {
     s0 += done.length;
   }
   c.length = s0;
-  c.finish_s = s0 - 2.0;  // halfway along the finish runway
+  c.finish_s = s0 - 2.0;  // 2 m before the end of the finish runway
   return c;
 }
 

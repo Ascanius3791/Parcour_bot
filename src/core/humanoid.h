@@ -38,6 +38,14 @@ class HumanoidLayout {
   // +1 the full positive limit and -1 the full negative limit (ranges can be asymmetric).
   void apply_action(const mjModel* m, mjData* d, const double* action) const;
 
+  // Position control, as muscles act like springs with damping: each joint action is a target
+  // angle (0 = the standing pose, +1 the upper and -1 the lower joint limit) tracked by a PD
+  // law whose torque is clamped to the same human limits. Grip actions stay torques.
+  // Call once per physics substep with the current action.
+  void apply_pd_action(const mjModel* m, mjData* d, const double* action) const;
+  double pd_kp = 5.0;     // stiffness: kp = pd_kp * max torque per radian
+  double pd_kd = 0.02;    // damping: kd = pd_kd * kp (higher chatters at dt = 2 ms)
+
   std::string segment_name(int i) const { return kSegmentNames[i]; }
   int segment_of_body(int body) const;  // -1 if not a major segment
 

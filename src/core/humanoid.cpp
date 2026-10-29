@@ -1,6 +1,7 @@
 #include "core/humanoid.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 namespace parcour {
@@ -59,6 +60,22 @@ void HumanoidLayout::apply_action(const mjModel* m, mjData* d, const double* act
     const double a = std::clamp(action[i], -1.0, 1.0);
     const double lo = m->actuator_ctrlrange[2 * i], hi = m->actuator_ctrlrange[2 * i + 1];
     d->ctrl[i] = a >= 0 ? a * hi : -a * lo;
+  }
+}
+
+void HumanoidLayout::apply_pd_action(const mjModel* m, mjData* d, const double* action) const {
+  for (int i = 0; i < nu_; ++i) {
+    const double a = std::clamp(action[i], -1.0, 1.0);
+    const double lo = m->actuator_ctrlrange[2 * i], hi = m->actuator_ctrlrange[2 * i + 1];
+    if (m->actuator_trntype[i] != mjTRN_JOINT) {
+      d->ctrl[i] = a >= 0 ? a * hi : -a * lo;
+      continue;
+    }
+    const int j = m->actuator_trnid[2 * i];
+    const double target = a >= 0 ? a * m->jnt_range[2 * j + 1] : -a * m->jnt_range[2 * j];
+    const double kp = pd_kp * std::max(std::fabs(lo), hi), kd = pd_kd * kp;
+    const double q = d->qpos[m->jnt_qposadr[j]], qd = d->qvel[m->jnt_dofadr[j]];
+    d->ctrl[i] = std::clamp(kp * (target - q) - kd * qd, lo, hi);
   }
 }
 

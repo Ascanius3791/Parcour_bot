@@ -7,11 +7,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-torch-2.7.1-cpu-py311
+      - name: Install PyTorch (CPU)
+        run: |
+          pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy
       - name: Fetch MuJoCo
         run: scripts/setup_deps.sh
       - name: Build
         run: |
-          cmake -S . -B build -G "Unix Makefiles" -DPARCOUR_BUILD_VIEWER=OFF
+          cmake -S . -B build -G "Unix Makefiles" -DPARCOUR_BUILD_VIEWER=OFF -DPython_EXECUTABLE="$(which python)"
           cmake --build build -j
       - name: Self-test
         run: build/parcour_selftest --threads 4
+      - name: Trainer test
+        run: python train/test_train.py

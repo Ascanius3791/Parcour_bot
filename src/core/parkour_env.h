@@ -11,25 +11,33 @@
 
 namespace parcour {
 
-enum class EndReason { kNone, kFinished, kBroken, kFell, kOffCourse, kStalled, kTimeout };
+enum class EndReason { kNone, kFinished, kBroken, kFell, kDown, kOffCourse, kStalled, kTimeout };
+inline constexpr int kNumEndReasons = 8;
 const char* end_reason_name(EndReason r);
 
 struct EnvConfig {
   CourseParams course;           // course.seed is the seed of the first course
   int episodes_per_course = 8;   // compiling a course takes ~20 ms, so reuse it a few times
   double start_s = 1.0;          // start position along the route
+  ActionMode action_mode = ActionMode::kTarget;
+  double init_noise = 0;         // random offset of every joint angle at reset (rad)
 
   // termination
   double fall_depth = 0.6;       // com this far below the lowest floor of its section = fell
+  double down_height = 0;        // com lower than this above the surface below it = down (0: off)
   double lateral_margin = 0.6;   // com this far outside the corridor = off course
   double stall_time = 5.0;       // no new 0.25 m of progress for this long = stalled
   double time_limit = 0;         // 0: 10 s + 1.5 s per metre of route
 
-  // reward per control step: w_progress * new progress (m) - w_time * dt,
-  // plus finish_bonus when finishing and - fail_penalty on fell / broken / off course
+  // reward per control step: w_progress * new progress (m) + (w_alive - w_time) * dt
+  // - w_action * mean(action^2) * dt, plus finish_bonus + finish_time_bonus * seconds left
+  // when finishing and - fail_penalty on fell / down / broken / off course
   double w_progress = 1.0;
+  double w_alive = 0.0;
   double w_time = 0.0;
+  double w_action = 0.0;
   double finish_bonus = 10.0;
+  double finish_time_bonus = 0.0;
   double fail_penalty = 0.0;
 
   PerceptionConfig perception;
@@ -71,6 +79,7 @@ class ParkourEnv {
   const Perception& perception() const { return perception_; }  // as of the last observe()
 
   double time() const;
+  double control_dt() const;
   double time_limit() const;
   double progress() const { return progress_; }          // current route distance of the com
   double best_progress() const { return best_; }         // furthest point reached
@@ -81,6 +90,8 @@ class ParkourEnv {
   EndReason end_reason() const { return reason_; }
   // Ranking score: metres reached, plus one point per second left when finished.
   double score() const;
+  // Height of the com above the course surface below it (infinity over a pit).
+  double height_above_ground();
 
  private:
   EnvConfig cfg_;
@@ -91,6 +102,7 @@ class ParkourEnv {
   Perception perception_;
   int episodes_on_course_ = 0;
   uint64_t next_seed_ = 0;
+  uint64_t noise_state_ = 0;
 
   double progress_ = 0, best_ = 0, lateral_ = 0;
   double stall_ref_ = 0, stall_since_ = 0, finish_time_ = 0;

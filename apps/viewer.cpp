@@ -1,12 +1,15 @@
 // Interactive 3D viewer for the parkour humanoid.
-// Usage: parcour_viewer [--seed N] [--difficulty D] [--obstacles N] [--section K]
-//                       [--overview] [--vision] [--screenshot out.ppm --at SECONDS]
+// Usage: parcour_viewer [--policy policy.bin] [--seed N] [--difficulty D] [--obstacles N]
+//                       [--track LENGTH] [--section K] [--overview] [--vision]
+//                       [--screenshot out.ppm --at SECONDS]
 //        parcour_viewer scene.xml        (a fixed scene instead of generated courses)
 //
 // Shows the body, its centre of mass, momentum and angular momentum, and colours every
 // segment by the stress on the joint above it (skin -> red; magenta = broken). On generated
 // courses it also shows the route, progress, how the run ended and what the bot perceives
-// (rays coloured by obstacle type, upcoming obstacles). Press H for the key list.
+// (rays coloured by obstacle type, upcoming obstacles). With --policy it runs a trained policy
+// (from train/) on the course it was trained for, unless --obstacles / --track / --difficulty
+// say otherwise. Press H for the key list.
 
 #include <GLFW/glfw3.h>
 
@@ -21,13 +24,14 @@
 
 #include "core/controllers.h"
 #include "core/parkour_env.h"
+#include "core/policy.h"
 #include "core/simulation.h"
 
 using namespace parcour;
 
 namespace {
 
-enum class Mode { kLimp, kHoldPose };
+enum class Mode { kLimp, kHoldPose, kPolicy };
 
 struct App {
   Simulation* sim = nullptr;
@@ -47,6 +51,10 @@ struct App {
   bool show_com = true, show_limbs = false, show_stress = true, show_help = false;
   bool tracking = true, show_route = true, show_vision = false;
   std::vector<float> obs;  // policy input, recomputed every frame for the vision overlay
+  std::unique_ptr<Policy> policy;
+  std::vector<float> policy_obs;
+  std::vector<double> action;
+  long substeps = 0;  // since reset; the policy acts every frame_skip substeps
   double drop_height = 2.0;
 
   // mouse state
@@ -67,7 +75,7 @@ const char* kHelp =
     "Dbl-click\nCtrl+L drag\nCtrl+R drag\nH";
 const char* kHelpText =
     "pause / run\nsingle step (paused)\nreset at start\ndrop from height\n"
-    "mode: limp / hold pose\ngrip on / off\ninvincible (no breaking)\ncom + momentum\n"
+    "mode: limp / hold pose / policy\ngrip on / off\ninvincible (no breaking)\ncom + momentum\n"
     "per-limb momentum\nstress colours\ntrack camera\ndrop height\n"
     "next / previous course\ndifficulty - / +\nstart at next / previous obstacle\n"
     "route + progress\nvision: rays + next obstacles\ncourse overview camera\n"
@@ -76,6 +84,7 @@ const char* kHelpText =
 void reset(double lift) {
   if (app.env) app.env->reset(lift, app.start_s);
   else app.sim->reset(lift);
+  app.substeps = 0;
   app.sim_wall_offset = glfwGetTime() - app.sim->data()->time;
   mjv_defaultPerturb(&app.pert);
   app.pert.select = 0;
@@ -129,7 +138,14 @@ void jump_section(int dir) {
 void apply_controller() {
   const mjModel* m = app.sim->model();
   mjData* d = app.sim->data();
-  if (app.mode == Mode::kHoldPose) {
+  if (app.mode == Mode::kPolicy) {
+    // same timing as training: observe and act at the control rate, PD on every substep
+    if (app.substeps % app.sim->frame_skip == 0) {
+      app.env->observe(app.policy_obs);
+      app.policy->act(app.policy_obs, app.action.data());
+    }
+    app.sim->layout().apply_pd_action(m, d, app.action.data());
+  } else if (app.mode == Mode::kHoldPose) {
     hold_pose_ctrl(m, d, app.grip ? 1.0 : 0.0);
   } else {
     mju_zero(d->ctrl, m->nu);
@@ -160,6 +176,7 @@ void physics() {
     mjv_applyPerturbForce(m, d, &app.pert);
     apply_controller();
     const bool ok = app.sim->substep();
+    ++app.substeps;
     if (!ok && !app.invincible) {
       app.paused = true;
       break;
@@ -330,6 +347,22 @@ void decorate() {
   }
 }
 
+std::string mode_name() {
+  switch (app.mode) {
+    case Mode::kLimp: return "limp";
+    case Mode::kHoldPose: return "hold pose";
+    case Mode::kPolicy: {
+      const auto stage = app.policy->meta().find("stage");
+      char buf[96];
+      std::snprintf(buf, sizeof(buf), "policy (%s, %.1f M steps)",
+                    stage == app.policy->meta().end() ? "?" : stage->second.c_str(),
+                    app.policy->meta_num("steps", 0) / 1e6);
+      return buf;
+    }
+  }
+  return "?";
+}
+
 void overlay(mjrRect vp) {
   const mjData* d = app.sim->data();
   const BodyState& s = app.sim->body_state();
@@ -346,7 +379,7 @@ void overlay(mjrRect vp) {
                 "%.2f s%s\n%.2fx real time\n%s%s\n%s\n%.2f m\n%.2f m/s\n%.1f kg m/s\n"
                 "%.2f kg m^2/s\n%.0f%% (%s)",
                 d->time, app.paused ? "  [paused]" : "", app.rtf,
-                app.mode == Mode::kLimp ? "limp" : "hold pose", app.invincible ? " (invincible)" : "",
+                mode_name().c_str(), app.invincible ? " (invincible)" : "",
                 app.grip ? "closed" : "open", s.com.z, s.com_vel.norm(), s.momentum.norm(),
                 s.ang_momentum.norm(), 100 * inj.loads()[worst].stress,
                 InjuryMonitor::joint_name(worst).c_str());
@@ -404,7 +437,16 @@ void on_key(GLFWwindow*, int key, int, int act, int) {
     case GLFW_KEY_RIGHT: if (app.paused) app.step_once = true; break;
     case GLFW_KEY_BACKSPACE: reset(0.0); app.paused = false; break;
     case GLFW_KEY_D: reset(app.drop_height); app.paused = false; break;
-    case GLFW_KEY_M: app.mode = app.mode == Mode::kLimp ? Mode::kHoldPose : Mode::kLimp; break;
+    case GLFW_KEY_M:
+      if (app.mode == Mode::kLimp) {
+        app.mode = Mode::kHoldPose;
+      } else if (app.mode == Mode::kHoldPose && app.policy) {
+        app.mode = Mode::kPolicy;
+        reset(0.0);
+      } else {
+        app.mode = Mode::kLimp;
+      }
+      break;
     case GLFW_KEY_G: app.grip = !app.grip; break;
     case GLFW_KEY_I:
       app.invincible = !app.invincible;
@@ -526,25 +568,61 @@ int main(int argc, char** argv) {
   double shot_time = 0;
   bool overview = false;
   int start_section = 0;
+  const char* policy_path = nullptr;
+  bool course_given = false;
+  double track = -1;
   for (int i = 1; i < argc; ++i) {
+    course_given |= !std::strcmp(argv[i], "--difficulty") || !std::strcmp(argv[i], "--obstacles") ||
+                    !std::strcmp(argv[i], "--track");
     if (!std::strcmp(argv[i], "--screenshot") && i + 1 < argc) screenshot = argv[++i];
     else if (!std::strcmp(argv[i], "--at") && i + 1 < argc) shot_time = std::atof(argv[++i]);
     else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) app.course.seed = std::stoull(argv[++i]);
     else if (!std::strcmp(argv[i], "--difficulty") && i + 1 < argc) app.course.difficulty = std::atof(argv[++i]);
     else if (!std::strcmp(argv[i], "--obstacles") && i + 1 < argc) app.course.num_obstacles = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--section") && i + 1 < argc) start_section = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--track") && i + 1 < argc) track = std::atof(argv[++i]);
+    else if (!std::strcmp(argv[i], "--policy") && i + 1 < argc) policy_path = argv[++i];
     else if (!std::strcmp(argv[i], "--overview")) overview = true;
     else if (!std::strcmp(argv[i], "--vision")) app.show_vision = true;
     else path = argv[i];
+  }
+  if (track >= 0) app.course.num_obstacles = 0, app.course.finish_length = track;
+  if (policy_path) {
+    try {
+      app.policy = std::make_unique<Policy>(policy_path);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "%s\n", e.what());
+      return 1;
+    }
+    if (!course_given) {  // the course the policy was trained on
+      app.course.num_obstacles = int(app.policy->meta_num("course_num_obstacles", app.course.num_obstacles));
+      app.course.finish_length = app.policy->meta_num("course_finish_length", app.course.finish_length);
+      app.course.difficulty = app.policy->meta_num("course_difficulty", app.course.difficulty);
+    }
+    if (!path.empty()) {
+      std::fprintf(stderr, "--policy needs a generated course, not a scene file\n");
+      return 1;
+    }
   }
   if (path.empty()) {
     EnvConfig cfg;
     cfg.course = app.course;
     cfg.episodes_per_course = 1 << 30;  // the viewer changes courses only on request
     cfg.stall_time = cfg.time_limit = 1e9;
+    // the policy sees the time left, so it needs the time limit it was trained with
+    if (app.policy) cfg.time_limit = app.policy->meta_num("env_time_limit", 0);
     app.env = std::make_unique<ParkourEnv>(cfg);
     app.sim = &app.env->sim();
     for (int k = 0; k < start_section; ++k) jump_section(+1);
+    if (app.policy) {
+      if (app.policy->obs_size() != app.env->obs_size() || app.policy->act_size() != app.sim->model()->nu) {
+        std::fprintf(stderr, "policy does not fit this build (obs %d vs %d, actions %d vs %d)\n",
+                     app.policy->obs_size(), app.env->obs_size(), app.policy->act_size(), int(app.sim->model()->nu));
+        return 1;
+      }
+      app.action.assign(app.sim->model()->nu, 0.0);
+      app.mode = Mode::kPolicy;
+    }
   } else {
     app.fixed_scene = std::make_unique<Simulation>(path);
     app.sim = app.fixed_scene.get();

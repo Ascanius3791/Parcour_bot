@@ -5,12 +5,18 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "core/body_state.h"
 #include "core/humanoid.h"
 #include "core/injury.h"
 
 namespace parcour {
+
+enum class ActionMode {
+  kTorque,  // actions are joint torques (HumanoidLayout::apply_action)
+  kTarget,  // actions are target joint angles (HumanoidLayout::apply_pd_action)
+};
 
 class Simulation {
  public:
@@ -27,6 +33,7 @@ class Simulation {
   const InjuryMonitor& injury() const { return *injury_; }
 
   int frame_skip = 10;  // physics substeps per control step (0.002 s * 10 = 50 Hz control)
+  ActionMode action_mode = ActionMode::kTorque;
 
   // Replaces the world (e.g. a new obstacle course); takes ownership. Call reset() afterwards.
   void set_model(mjModel* model);
@@ -36,13 +43,16 @@ class Simulation {
   // Same, with the feet on the point `feet` and facing `yaw`.
   void reset_at(const Vec3& feet, double yaw, double lift = 0.0);
 
-  // Applies a policy action in [-1, 1]^nu for one control period.
+  // Applies a policy action in [-1, 1]^nu for one control period (see action_mode).
   // Returns false as soon as a joint breaks (the episode is over).
   bool step(const double* action);
 
   // Advances one physics substep using whatever is in d->ctrl / d->xfrc_applied.
   // Returns false if a joint is broken.
   bool substep();
+
+  // Recomputes derived quantities after qpos / qvel were edited directly.
+  void forward();
 
   bool broken() const { return injury_->broken_segment() >= 0; }
 
@@ -55,6 +65,7 @@ class Simulation {
   std::unique_ptr<HumanoidLayout> layout_;
   std::unique_ptr<InjuryMonitor> injury_;
   InjuryConfig injury_cfg_;
+  std::vector<double> action_;
   BodyState state_;
   double state_time_ = -1;
 };
