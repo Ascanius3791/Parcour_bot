@@ -1,0 +1,20 @@
+<!-- Physics options, visuals and materials shared by every scene. -->
+<mujoco>
+  <compiler angle="degree" autolimits="true"/>
+  <option timestep="0.002" integrator="implicitfast" iterations="30" ls_iterations="10"/>
+  <size memory="20M"/>
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+    <quality shadowsize="4096"/>
+    <headlight ambient="0.35 0.35 0.35" diffuse="0.5 0.5 0.5" specular="0.1 0.1 0.1"/>
+    <map znear="0.01" zfar="200"/>
+  </visual>
+  <asset>
+    <texture name="sky" type="skybox" builtin="gradient" rgb1="0.45 0.6 0.8" rgb2="0.1 0.12 0.18" width="512" height="512"/>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.32 0.34 0.38" rgb2="0.27 0.29 0.33" width="512" height="512" mark="edge" markrgb="0.45 0.47 0.5"/>
+    <material name="grid" texture="grid" texrepeat="1 1" texuniform="true" reflectance="0.05"/>
+  </asset>
+  <worldbody>
+    <light name="sun" directional="true" pos="0 0 10" dir="-0.3 0.2 -1" diffuse="0.7 0.7 0.7" castshadow="true"/>
+  </worldbody>
+</mujoco>

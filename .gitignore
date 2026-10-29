@@ -1,0 +1,7 @@
+build/
+third_party/
+__pycache__/
+*.pyc
+runs/
+checkpoints/
+*.mp4

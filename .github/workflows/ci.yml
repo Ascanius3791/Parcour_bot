@@ -1,0 +1,17 @@
+name: build-and-test
+on:
+  push:
+  pull_request:
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch MuJoCo
+        run: scripts/setup_deps.sh
+      - name: Build
+        run: |
+          cmake -S . -B build -G "Unix Makefiles" -DPARCOUR_BUILD_VIEWER=OFF
+          cmake --build build -j
+      - name: Self-test
+        run: build/parcour_selftest --threads 4
