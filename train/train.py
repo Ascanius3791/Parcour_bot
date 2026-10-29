@@ -230,6 +230,7 @@ class Trainer:
         for k, v in st["course"].items():
             meta["course_" + k] = v
         meta["env_time_limit"] = st["env"].get("time_limit", 0)
+        meta["env_down_height"] = st["env"].get("down_height", 0)
         return meta
 
     def save(self):

@@ -35,7 +35,8 @@ scene file instead, e.g. `build/parcour_viewer assets/scene_flat.xml`, to get th
 plain floor.
 
 With a policy the viewer plays on by itself (autoplay, key A): after a fall it
-continues at the next obstacle, after the finish on the next course.
+continues at the next obstacle, after the finish on the next course. A run
+also ends when the bot lies down or makes no progress for 5 s.
 
 The viewer needs a display (WSLg on Windows 11 works out of the box). Build
 without it via `-DPARCOUR_BUILD_VIEWER=OFF`. Under WSL it renders in software:
@@ -45,6 +46,9 @@ driver. The overlay shows the frame rate and whether the simulation keeps up
 with real time.
 
 ### Viewer controls
+
+Keys go by the character they type, so on a German keyboard [ and ] are AltGr+8
+and AltGr+9.
 
 | Key | Action |
 |---|---|
@@ -59,7 +63,8 @@ with real time.
 | C / L / S | com + momentum arrows / per-limb momentum / stress colours |
 | T | tracking camera on/off |
 | N / P | next / previous course (seed) |
-| [ / ] | difficulty down / up (0.1 steps) |
+| O | obstacles on / off (a policy starts on the flat track it was trained on) |
+| [ / ] | obstacle difficulty down / up (0.1 steps; no effect on a flat track) |
 | J / K | start at the next / previous obstacle |
 | V | camera overview of the whole course |
 | R | route, checkpoints and progress marker |

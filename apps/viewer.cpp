@@ -10,7 +10,8 @@
 // (rays coloured by obstacle type, upcoming obstacles). With --policy it runs a trained policy
 // (from train/) on the course it was trained for, unless --obstacles / --track / --difficulty
 // say otherwise, and keeps going by itself: after a fall it continues at the next obstacle,
-// after the finish on the next course (A toggles this). Press H for the key list.
+// after the finish on the next course (A toggles this). O switches between the flat track
+// and an obstacle course, [ / ] change the obstacle difficulty. Press H for the key list.
 //
 // Graphics: shadows and reflections are off unless --pretty (or F). Under WSL the GPU driver
 // is far slower than software rendering at presenting frames (~1 fps), so the viewer renders
@@ -66,6 +67,9 @@ struct App {
   std::vector<double> action;
   long substeps = 0;  // since reset; the policy acts every frame_skip substeps
   double drop_height = 2.0;
+  // O switches between a flat track and an obstacle course; these remember the other one
+  int obstacles = 6;
+  double runway = CourseParams{}.finish_length, track_length = 30;
 
   // mouse state
   bool btn_left = false, btn_right = false;
@@ -82,7 +86,7 @@ App app;
 
 const char* kHelp =
     "Space\nRight\nBackspace\nD\nM\nA\nG\nI\nC\nL\nS\nT\nF\n+ / -\n"
-    "N / P\n[ / ]\nJ / K\nR\nY\nV\n"
+    "N / P\nO\n[ / ]\nJ / K\nR\nY\nV\n"
     "Dbl-click\nCtrl+L drag\nCtrl+R drag\nH";
 const char* kHelpText =
     "pause / run\nsingle step (paused)\nreset at start\ndrop from height\n"
@@ -90,7 +94,7 @@ const char* kHelpText =
     "invincible (no breaking)\ncom + momentum\n"
     "per-limb momentum\nstress colours\ntrack camera\nshadows + reflections (slower)\n"
     "drop height\n"
-    "next / previous course\ndifficulty - / +\nstart at next / previous obstacle\n"
+    "next / previous course\nobstacles on / off\nobstacle difficulty - / +\nstart at next / previous obstacle\n"
     "route + progress\nvision: rays + next obstacles\ncourse overview camera\n"
     "select body\nrotate body\npull body\nhelp";
 
@@ -459,8 +463,11 @@ void overlay(mjrRect vp) {
     const Course& c = e.course();
     char l2[160], r2[320];
     std::snprintf(l2, sizeof(l2), "\ncourse\nsection\nprogress\nscore");
-    std::snprintf(r2, sizeof(r2), "\nseed %llu, difficulty %.1f\n%d / %d  %s\n%.1f / %.1f m\n%.1f",
-                  (unsigned long long)c.params.seed, c.params.difficulty, e.section() + 1,
+    char kind[64];
+    if (c.params.num_obstacles > 0) std::snprintf(kind, sizeof(kind), "difficulty %.1f", c.params.difficulty);
+    else std::snprintf(kind, sizeof(kind), "flat track (O: obstacles)");
+    std::snprintf(r2, sizeof(r2), "\nseed %llu, %s\n%d / %d  %s\n%.1f / %.1f m\n%.1f",
+                  (unsigned long long)c.params.seed, kind, e.section() + 1,
                   int(c.sections.size()), obstacle_name(c.sections[e.section()].type),
                   e.best_progress(), c.finish_s, e.score());
     std::strncat(left, l2, sizeof(left) - std::strlen(left) - 1);
@@ -515,14 +522,23 @@ void overlay(mjrRect vp) {
 
 // ---------------------------------------------------------------- input
 
+// Keys that type no character. Everything else goes by the typed character (on_char), so
+// it works on any keyboard layout (on a German one [ and ] are AltGr+8 / AltGr+9).
 void on_key(GLFWwindow*, int key, int, int act, int) {
   if (act == GLFW_RELEASE) return;
   switch (key) {
     case GLFW_KEY_SPACE: app.paused = !app.paused; break;
     case GLFW_KEY_RIGHT: if (app.paused) app.step_once = true; break;
     case GLFW_KEY_BACKSPACE: reset(0.0); app.paused = false; break;
-    case GLFW_KEY_D: reset(app.drop_height); app.paused = false; break;
-    case GLFW_KEY_M:
+    default: break;
+  }
+}
+
+void on_char(GLFWwindow*, unsigned int codepoint) {
+  const int ch = codepoint < 128 ? std::tolower(int(codepoint)) : 0;
+  switch (ch) {
+    case 'd': reset(app.drop_height); app.paused = false; break;
+    case 'm':
       if (app.mode == Mode::kLimp) {
         app.mode = Mode::kHoldPose;
       } else if (app.mode == Mode::kHoldPose && app.policy) {
@@ -532,49 +548,60 @@ void on_key(GLFWwindow*, int key, int, int act, int) {
         app.mode = Mode::kLimp;
       }
       break;
-    case GLFW_KEY_A:
+    case 'a':
       app.autoplay = !app.autoplay;
       app.ended_at = -1;
       break;
-    case GLFW_KEY_F:
+    case 'f':
       app.pretty = !app.pretty;
       apply_graphics();
       break;
-    case GLFW_KEY_G: app.grip = !app.grip; break;
-    case GLFW_KEY_I:
+    case 'g': app.grip = !app.grip; break;
+    case 'i':
       app.invincible = !app.invincible;
       if (app.invincible) app.paused = false;
       break;
-    case GLFW_KEY_C: app.show_com = !app.show_com; break;
-    case GLFW_KEY_L: app.show_limbs = !app.show_limbs; break;
-    case GLFW_KEY_S: app.show_stress = !app.show_stress; break;
-    case GLFW_KEY_H: app.show_help = !app.show_help; break;
-    case GLFW_KEY_T:
+    case 'c': app.show_com = !app.show_com; break;
+    case 'l': app.show_limbs = !app.show_limbs; break;
+    case 's': app.show_stress = !app.show_stress; break;
+    case 'h': app.show_help = !app.show_help; break;
+    case 't':
       app.tracking = !app.tracking;
       app.cam.type = app.tracking ? mjCAMERA_TRACKING : mjCAMERA_FREE;
       break;
-    case GLFW_KEY_EQUAL: case GLFW_KEY_KP_ADD: app.drop_height += 0.5; break;
-    case GLFW_KEY_MINUS: case GLFW_KEY_KP_SUBTRACT:
-      app.drop_height = std::max(0.0, app.drop_height - 0.5);
-      break;
-    case GLFW_KEY_N: case GLFW_KEY_P:
+    case '+': app.drop_height += 0.5; break;
+    case '-': app.drop_height = std::max(0.0, app.drop_height - 0.5); break;
+    case 'n': case 'p':
       if (app.env) {
-        app.course.seed = key == GLFW_KEY_N ? app.course.seed + 1 : std::max<uint64_t>(1, app.course.seed - 1);
+        app.course.seed = ch == 'n' ? app.course.seed + 1 : std::max<uint64_t>(1, app.course.seed - 1);
         load_course();
       }
       break;
-    case GLFW_KEY_LEFT_BRACKET: case GLFW_KEY_RIGHT_BRACKET:
+    case 'o':
       if (app.env) {
-        const double step = key == GLFW_KEY_RIGHT_BRACKET ? 0.1 : -0.1;
+        CourseParams& c = app.course;
+        if (c.num_obstacles > 0) {
+          app.obstacles = c.num_obstacles, app.runway = c.finish_length;
+          c.num_obstacles = 0, c.finish_length = app.track_length;
+        } else {
+          app.track_length = c.finish_length;
+          c.num_obstacles = app.obstacles, c.finish_length = app.runway;
+        }
+        load_course();
+      }
+      break;
+    case '[': case ']':
+      if (app.env) {
+        const double step = ch == ']' ? 0.1 : -0.1;
         app.course.difficulty = std::clamp(std::round((app.course.difficulty + step) * 10) / 10, 0.0, 1.0);
         load_course();
       }
       break;
-    case GLFW_KEY_J: jump_section(+1); break;
-    case GLFW_KEY_K: jump_section(-1); break;
-    case GLFW_KEY_R: app.show_route = !app.show_route; break;
-    case GLFW_KEY_Y: app.show_vision = !app.show_vision; break;
-    case GLFW_KEY_V: overview_camera(); break;
+    case 'j': jump_section(+1); break;
+    case 'k': jump_section(-1); break;
+    case 'r': app.show_route = !app.show_route; break;
+    case 'y': app.show_vision = !app.show_vision; break;
+    case 'v': overview_camera(); break;
     default: break;
   }
 }
@@ -706,7 +733,12 @@ int main(int argc, char** argv) {
     cfg.episodes_per_course = 1 << 30;  // the viewer changes courses only on request
     cfg.stall_time = cfg.time_limit = 1e9;
     // the policy sees the time left, so it needs the time limit it was trained with
-    if (app.policy) cfg.time_limit = app.policy->meta_num("env_time_limit", 0);
+    if (app.policy) {
+      cfg.time_limit = app.policy->meta_num("env_time_limit", 0);
+      // end runs where it lies down or gets stuck, as in training, so autoplay moves on
+      cfg.down_height = app.policy->meta_num("env_down_height", 0.5);
+      cfg.stall_time = 5;
+    }
     app.env = std::make_unique<ParkourEnv>(cfg);
     app.sim = &app.env->sim();
     for (int k = 0; k < start_section; ++k) jump_section(+1);
@@ -758,6 +790,7 @@ int main(int argc, char** argv) {
   app.cam.elevation = -15;
 
   glfwSetKeyCallback(window, on_key);
+  glfwSetCharCallback(window, on_char);
   glfwSetMouseButtonCallback(window, on_button);
   glfwSetCursorPosCallback(window, on_move);
   glfwSetScrollCallback(window, on_scroll);
