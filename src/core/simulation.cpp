@@ -1,16 +1,24 @@
 #include "core/simulation.h"
 
+#include <cmath>
 #include <stdexcept>
 
 namespace parcour {
 
-Simulation::Simulation(const std::string& xml_path, InjuryConfig injury) {
+namespace {
+mjModel* load(const std::string& xml_path) {
   char err[1024] = "";
-  m_ = mj_loadXML(xml_path.c_str(), nullptr, err, sizeof(err));
-  if (!m_) throw std::runtime_error("failed to load " + xml_path + ": " + err);
-  d_ = mj_makeData(m_);
-  layout_ = std::make_unique<HumanoidLayout>(m_);
-  injury_ = std::make_unique<InjuryMonitor>(m_, *layout_, injury);
+  mjModel* m = mj_loadXML(xml_path.c_str(), nullptr, err, sizeof(err));
+  if (!m) throw std::runtime_error("failed to load " + xml_path + ": " + err);
+  return m;
+}
+}  // namespace
+
+Simulation::Simulation(const std::string& xml_path, InjuryConfig injury)
+    : Simulation(load(xml_path), injury) {}
+
+Simulation::Simulation(mjModel* model, InjuryConfig injury) : injury_cfg_(injury) {
+  set_model(model);
   reset();
 }
 
@@ -19,9 +27,28 @@ Simulation::~Simulation() {
   mj_deleteModel(m_);
 }
 
-void Simulation::reset(double lift) {
+void Simulation::set_model(mjModel* model) {
+  injury_.reset();
+  layout_.reset();
+  mj_deleteData(d_);
+  mj_deleteModel(m_);
+  m_ = model;
+  d_ = mj_makeData(m_);
+  layout_ = std::make_unique<HumanoidLayout>(m_);
+  injury_ = std::make_unique<InjuryMonitor>(m_, *layout_, injury_cfg_);
+  state_time_ = -1;
+}
+
+void Simulation::reset(double lift) { reset_at({}, 0.0, lift); }
+
+void Simulation::reset_at(const Vec3& feet, double yaw, double lift) {
   mj_resetData(m_, d_);
-  d_->qpos[layout_->root_qpos + 2] += 0.002 + lift;  // start just above the floor
+  double* root = d_->qpos + layout_->root_qpos;
+  // the default pose stands on z = 0 at the origin; start just above the floor
+  root[0] += feet.x;
+  root[1] += feet.y;
+  root[2] += feet.z + 0.002 + lift;
+  root[3] = std::cos(yaw / 2), root[4] = 0, root[5] = 0, root[6] = std::sin(yaw / 2);
   mj_forward(m_, d_);
   injury_->reset();
   state_time_ = -1;

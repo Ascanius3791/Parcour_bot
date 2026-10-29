@@ -1,0 +1,9 @@
+<!-- Base scene for generated obstacle courses: the course geoms are added in code
+     (src/core/course.cpp). The plane far below is the bottom of the abyss. -->
+<mujoco model="parcour_course">
+  <include file="common.xml"/>
+  <include file="humanoid.xml"/>
+  <worldbody>
+    <geom name="abyss" type="plane" pos="0 0 -6" size="0 0 0.05" material="grid" contype="1" conaffinity="1"/>
+  </worldbody>
+</mujoco>

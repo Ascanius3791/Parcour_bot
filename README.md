@@ -14,8 +14,13 @@ scripts/setup_deps.sh                 # downloads MuJoCo 3.17.0 into third_party
 cmake -S . -B build -G Ninja
 cmake --build build
 build/parcour_selftest                # physics sanity checks + speed benchmark
-build/parcour_viewer                  # interactive 3D viewer
+build/parcour_viewer                  # interactive 3D viewer on a generated course
 ```
+
+Viewer options: `--seed N`, `--difficulty 0..1`, `--obstacles N`, `--section K`
+(start at the K-th section), `--overview` (camera on the whole course). Pass a
+scene file instead, e.g. `build/parcour_viewer assets/scene_flat.xml`, to get the
+plain floor.
 
 The viewer needs a display (WSLg on Windows 11 works out of the box). Build
 without it via `-DPARCOUR_BUILD_VIEWER=OFF`.
@@ -32,6 +37,11 @@ without it via `-DPARCOUR_BUILD_VIEWER=OFF`.
 | I | invincible (joints don't break) |
 | C / L / S | com + momentum arrows / per-limb momentum / stress colours |
 | T | tracking camera on/off |
+| N / P | next / previous course (seed) |
+| [ / ] | difficulty down / up (0.1 steps) |
+| J / K | start at the next / previous obstacle |
+| V | camera overview of the whole course |
+| R | route, checkpoints and progress marker |
 | Mouse | left drag rotate, right drag pan, scroll zoom |
 | Double-click, then Ctrl+drag | select a body, then rotate (left) or pull (right) it |
 
@@ -76,6 +86,33 @@ velocities, grip state, foot contact forces, head accelerometer/gyro and joint
 stress. `BodyState::flatten` turns this into a 438-value, heading-invariant
 policy input.
 
+## Obstacle courses
+
+[`src/core/course.h`](src/core/course.h) generates a corridor from a seed and a
+difficulty in [0, 1]: a start runway, N obstacle sections and a finish runway.
+The corridor turns by up to 25° between sections and floats over an abyss, so
+leaving it sideways or missing a jump is a fall.
+
+| Obstacle | Easy (difficulty 0) | Hard (difficulty 1) |
+|---|---|---|
+| Stairs (up or down) | 2–3 steps, 10–12 cm | up to 8 steps, 10–22 cm |
+| Hurdle (board or vault box) | 15–20 cm | up to 1 m high, 0.9 m deep |
+| Wall with a hole | hole 1.0–1.2 m wide, 1.2–1.3 m tall, at the floor | hole down to 0.65 × 0.7 m, up to 0.9 m above the floor |
+| Balance beam over a pit | 45–60 cm wide, 1.5–2 m long | 12–25 cm wide, up to 5 m long |
+| Swing bars over a pit | 1 bar at 2.0 m, 1–1.4 m pit | up to 3 bars at 2.0–2.4 m, pit up to 6.4 m |
+| Platforms (pillars with gaps) | 2 pillars, 20–30 cm gaps, steps of −0.3 to +0.2 m | up to 4 narrower pillars, gaps up to 1.5 m, steps of −0.8 to +1 m |
+
+The same seed always gives the same course, on every machine. Every piece is
+tagged with its obstacle type and section (for the bot's perception later).
+
+[`src/core/parkour_env.h`](src/core/parkour_env.h) wraps a simulation and a course
+into a training environment. Progress is the distance along the route of the
+furthest point the centre of mass has reached; a run ends when the bot
+finishes, breaks a joint, falls (com 0.6 m below the floor), leaves the
+corridor, stalls (no new 25 cm in 5 s) or runs out of time (10 s + 1.5 s per
+metre). The score is metres reached, plus one point per second left when it
+finishes. Building a course takes ~20 ms, so each one is reused for 8 episodes.
+
 ## Layout
 
 ```
@@ -89,7 +126,7 @@ scripts/       dependency setup
 ## Roadmap
 
 1. ~~Humanoid, joint limits, injuries, sensors, viewer~~
-2. Procedural obstacle course generator + route scoring
+2. ~~Procedural obstacle course generator + route scoring~~
 3. Environment observations of the surroundings (rays reporting obstacle type and pose)
 4. Training (PPO) on CPU threads and GitHub runners: standing → walking → running
 5. Stairs, platforms, hurdles → wall holes → swing bars

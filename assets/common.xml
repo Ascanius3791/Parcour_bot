@@ -13,6 +13,8 @@
     <texture name="sky" type="skybox" builtin="gradient" rgb1="0.45 0.6 0.8" rgb2="0.1 0.12 0.18" width="512" height="512"/>
     <texture name="grid" type="2d" builtin="checker" rgb1="0.32 0.34 0.38" rgb2="0.27 0.29 0.33" width="512" height="512" mark="edge" markrgb="0.45 0.47 0.5"/>
     <material name="grid" texture="grid" texrepeat="1 1" texuniform="true" reflectance="0.05"/>
+    <texture name="floor" type="2d" builtin="checker" rgb1="0.56 0.58 0.6" rgb2="0.48 0.5 0.53" width="512" height="512" mark="edge" markrgb="0.66 0.68 0.7"/>
+    <material name="floor" texture="floor" texrepeat="1 1" texuniform="true" reflectance="0.05"/>
   </asset>
   <worldbody>
     <light name="sun" directional="true" pos="0 0 10" dir="-0.3 0.2 -1" diffuse="0.7 0.7 0.7" castshadow="true"/>

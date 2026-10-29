@@ -28,7 +28,9 @@ add_library(parcour_core
   src/core/humanoid.cpp
   src/core/injury.cpp
   src/core/body_state.cpp
-  src/core/simulation.cpp)
+  src/core/simulation.cpp
+  src/core/course.cpp
+  src/core/parkour_env.cpp)
 target_include_directories(parcour_core PUBLIC src)
 target_link_libraries(parcour_core PUBLIC mujoco)
 target_compile_options(parcour_core PRIVATE -Wall -Wextra)

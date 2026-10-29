@@ -1,0 +1,91 @@
+#pragma once
+// One training environment: a humanoid running through generated obstacle courses, with
+// progress scoring and episode termination.
+
+#include <memory>
+#include <string>
+
+#include "core/course.h"
+#include "core/simulation.h"
+
+namespace parcour {
+
+enum class EndReason { kNone, kFinished, kBroken, kFell, kOffCourse, kStalled, kTimeout };
+const char* end_reason_name(EndReason r);
+
+struct EnvConfig {
+  CourseParams course;           // course.seed is the seed of the first course
+  int episodes_per_course = 8;   // compiling a course takes ~20 ms, so reuse it a few times
+  double start_s = 1.0;          // start position along the route
+
+  // termination
+  double fall_depth = 0.6;       // com this far below the lowest floor of its section = fell
+  double lateral_margin = 0.6;   // com this far outside the corridor = off course
+  double stall_time = 5.0;       // no new 0.25 m of progress for this long = stalled
+  double time_limit = 0;         // 0: 10 s + 1.5 s per metre of route
+
+  // reward per control step: w_progress * new progress (m) - w_time * dt,
+  // plus finish_bonus when finishing and - fail_penalty on fell / broken / off course
+  double w_progress = 1.0;
+  double w_time = 0.0;
+  double finish_bonus = 10.0;
+  double fail_penalty = 0.0;
+};
+
+struct StepResult {
+  double reward = 0;
+  bool done = false;
+  EndReason reason = EndReason::kNone;
+};
+
+class ParkourEnv {
+ public:
+  explicit ParkourEnv(EnvConfig cfg = {}, const std::string& base_scene = default_course_scene());
+  ~ParkourEnv();
+  ParkourEnv(const ParkourEnv&) = delete;
+  ParkourEnv& operator=(const ParkourEnv&) = delete;
+
+  // Starts a new episode; generates the next course every episodes_per_course episodes.
+  // start_s < 0 uses config().start_s; it must lie on flat floor (a runway or an approach).
+  void reset(double lift = 0.0, double start_s = -1);
+  // Switches to a specific course now (the next reset() starts on it).
+  void new_course(const CourseParams& params);
+  // Applies an action for one control step and evaluates the episode.
+  StepResult step(const double* action);
+  // Updates progress and checks termination for the current state; step() calls this.
+  // Useful when the simulation is advanced by other means (the viewer).
+  StepResult evaluate();
+
+  Simulation& sim() { return *sim_; }
+  const Course& course() const { return course_; }
+  const EnvConfig& config() const { return cfg_; }
+  int first_course_geom() const { return first_geom_; }  // course piece i = this geom id + i
+
+  double time() const;
+  double time_limit() const;
+  double progress() const { return progress_; }          // current route distance of the com
+  double best_progress() const { return best_; }         // furthest point reached
+  double lateral() const { return lateral_; }
+  int section() const { return section_; }
+  int sections_cleared() const;
+  bool finished() const { return reason_ == EndReason::kFinished; }
+  EndReason end_reason() const { return reason_; }
+  // Ranking score: metres reached, plus one point per second left when finished.
+  double score() const;
+
+ private:
+  EnvConfig cfg_;
+  mjSpec* base_ = nullptr;
+  std::unique_ptr<Simulation> sim_;
+  Course course_;
+  int first_geom_ = -1;
+  int episodes_on_course_ = 0;
+  uint64_t next_seed_ = 0;
+
+  double progress_ = 0, best_ = 0, lateral_ = 0;
+  double stall_ref_ = 0, stall_since_ = 0, finish_time_ = 0;
+  int section_ = 0;
+  EndReason reason_ = EndReason::kNone;
+};
+
+}  // namespace parcour

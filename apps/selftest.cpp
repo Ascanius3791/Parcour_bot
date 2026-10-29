@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/controllers.h"
+#include "core/parkour_env.h"
 #include "core/simulation.h"
 
 using namespace parcour;
@@ -214,31 +215,195 @@ void test_joint_limits(Simulation& sim) {
             (worst_j >= 0 ? std::string(" at ") + mj_id2name(m, mjOBJ_JOINT, worst_j) : ""));
 }
 
-void benchmark(const std::string& path, int threads) {
-  std::puts("benchmark (random actions, sensors + injury monitor every step)");
+void test_course_generation() {
+  std::puts("course generator");
+  int counts[kNumObstacleTypes] = {};
+  double worst_gap = 0, worst_proj = 0, max_level = 0, max_len = 0;
+  bool levels_ok = true, heading_ok = true, sizes_ok = true;
+  const int n = 300;
+  int same_as_previous = 0;
+  std::vector<Obstacle> previous;
+  for (int seed = 1; seed <= n; ++seed) {
+    CourseParams p;
+    p.seed = seed;
+    p.difficulty = (seed % 3) * 0.5;
+    const Course c = generate_course(p);
+    std::vector<Obstacle> types;
+    for (const Section& s : c.sections) types.push_back(s.type);
+    same_as_previous += types == previous;
+    previous = types;
+    max_len = std::max(max_len, c.length);
+    for (size_t i = 0; i < c.sections.size(); ++i) {
+      const Section& s = c.sections[i];
+      ++counts[int(s.type)];
+      if (i + 1 < c.sections.size()) {  // sections join up, in space and in route distance
+        const Section& next = c.sections[i + 1];
+        worst_gap = std::max(worst_gap, (s.to_world(s.length, 0, s.level_out) - next.origin).norm() +
+                                            std::fabs(s.s0 + s.length - next.s0));
+      }
+      levels_ok &= s.level_min >= -1e-9 && s.level_min <= std::min(s.level_in, s.level_out) &&
+                   std::max(s.level_in, s.level_out) <= 2.4 + 1e-9;
+      max_level = std::max(max_level, s.level_out);
+      heading_ok &= std::fabs(s.yaw) <= 75 * M_PI / 180 + 1e-9;
+      const RoutePoint rp = c.project(s.to_world(s.length / 2, 0.3, 0));
+      worst_proj = std::max(worst_proj, std::fabs(rp.s - (s.s0 + s.length / 2)) +
+                                            std::fabs(rp.lateral - 0.3) + (rp.section != int(i)));
+    }
+    for (const Piece& pc : c.pieces) {
+      sizes_ok &= pc.size.x > 0 && pc.size.y > 0 && (pc.shape != mjGEOM_BOX || pc.size.z > 0);
+    }
+  }
+  std::printf("  %d courses: ", n);
+  for (int t = 1; t < kNumObstacleTypes; ++t) std::printf("%s %d  ", obstacle_name(Obstacle(t)), counts[t]);
+  std::printf("\n  longest %.1f m, highest floor %.2f m\n", max_len, max_level);
+  bool all_types = true;
+  for (int t = 1; t < kNumObstacleTypes; ++t) all_types &= counts[t] > n / 2;
+  check(all_types, "every obstacle type is generated");
+  check(worst_gap < 1e-9, "sections join up", fmt("(worst %.1e)", worst_gap));
+  check(levels_ok, "floor levels within [0, 2.4] m");
+  check(heading_ok, "route heading within +-75 deg");
+  check(sizes_ok, "all pieces have positive size");
+  check(worst_proj < 1e-9, "route projection", fmt("(worst %.1e)", worst_proj));
+  check(same_as_previous < 3, "neighbouring seeds give unrelated courses",
+        fmt("(%.0f identical obstacle sequences)", same_as_previous));
+
+  CourseParams p;
+  p.seed = 42;
+  const Course a = generate_course(p), b = generate_course(p);
+  bool same = a.pieces.size() == b.pieces.size();
+  for (size_t i = 0; same && i < a.pieces.size(); ++i) {
+    same = (a.pieces[i].pos - b.pieces[i].pos).norm() == 0 && (a.pieces[i].size - b.pieces[i].size).norm() == 0;
+  }
+  p.seed = 43;
+  check(same && generate_course(p).length != a.length,
+        "same seed -> same course, other seed -> other course");
+}
+
+// Runs the hold-pose controller inside the env until done or `seconds`; returns the reason.
+EndReason run_env_hold(ParkourEnv& env, double seconds) {
+  mjData* d = env.sim().data();
+  while (d->time < seconds) {
+    hold_pose_ctrl(env.sim().model(), d, 0);
+    env.sim().substep();
+    const StepResult r = env.evaluate();
+    if (r.done) return r.reason;
+  }
+  return EndReason::kNone;
+}
+
+// Course with at least one section of the given type.
+CourseParams course_with(Obstacle type, uint64_t seed = 1) {
+  CourseParams p;
+  for (;; ++seed) {
+    p.seed = seed;
+    for (const Section& s : generate_course(p).sections) {
+      if (s.type == type) return p;
+    }
+  }
+}
+
+const Section& first_section(const Course& c, Obstacle type) {
+  for (const Section& s : c.sections) {
+    if (s.type == type) return s;
+  }
+  return c.sections.front();
+}
+
+void test_course_physics() {
+  std::puts("course physics");
+  EnvConfig cfg;
+  cfg.episodes_per_course = 1000000;
+  ParkourEnv env(cfg);
+  const mjModel* m = env.sim().model();
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int k = 0; k < 5; ++k) env.new_course(env.course().params);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 5;
+  m = env.sim().model();
+  std::printf("  %zu pieces, %d geoms, course build %.1f ms\n", env.course().pieces.size(), int(m->ngeom), ms);
+  bool tagged = true;
+  for (size_t i = 0; i < env.course().pieces.size(); ++i) {
+    tagged &= std::string(mj_id2name(m, mjOBJ_GEOM, env.first_course_geom() + int(i))) ==
+              "course_" + std::to_string(i);
+  }
+  check(tagged, "course piece i is geom first_course_geom + i");
+
+  env.reset();
+  EndReason r = run_env_hold(env, 0.5);
+  const double com_z = env.sim().body_state().com.z;
+  check(r == EndReason::kNone && com_z > 0.85 && com_z < 1.05, "standing on the start runway",
+        std::string("(") + end_reason_name(r) + fmt(", com %.2f m)", com_z));
+
+  // land on a platform pillar: it must carry the body
+  env.new_course(course_with(Obstacle::kPlatform));
+  const Course& c = env.course();
+  const Piece* pillar = nullptr;
+  for (const Piece& pc : c.pieces) {
+    if (pc.type == Obstacle::kPlatform && pc.size.x > 0.45 && pc.size.y > 0.45) {
+      pillar = &pc;
+      break;
+    }
+  }
+  const double top = pillar->pos.z + pillar->size.z;
+  env.reset();
+  env.sim().reset_at({pillar->pos.x, pillar->pos.y, top}, c.sections[pillar->section].yaw, 0.05);
+  r = run_env_hold(env, 0.4);
+  const double above = env.sim().body_state().com.z - top;
+  check(r == EndReason::kNone && above > 0.8, "standing on a platform pillar",
+        fmt("(com %.2f m above its top)", above));
+
+  // step into the pit beside a balance beam: must end as a fall
+  env.new_course(course_with(Obstacle::kBeam));
+  const Section& beam_sec = first_section(env.course(), Obstacle::kBeam);
+  Vec3 beam;
+  for (const Piece& pc : env.course().pieces) {
+    if (pc.type == Obstacle::kBeam) beam = pc.pos;
+  }
+  const double u = 0.5 * (beam_sec.obstacle_start + beam_sec.obstacle_end);
+  Vec3 spot = beam_sec.to_world(u, 0.9, beam_sec.level_in);
+  const Vec3 other = beam_sec.to_world(u, -0.9, beam_sec.level_in);
+  if (std::hypot(other.x - beam.x, other.y - beam.y) > std::hypot(spot.x - beam.x, spot.y - beam.y)) spot = other;
+  env.reset();
+  env.sim().reset_at(spot, beam_sec.yaw);
+  r = run_env_hold(env, 3.0);
+  check(r == EndReason::kFell, "stepping into a pit ends the run", std::string("(") + end_reason_name(r) + ")");
+
+  // standing past the finish line
+  env.reset(0.0, env.course().finish_s + 0.5);
+  r = env.evaluate().reason;
+  check(r == EndReason::kFinished && env.score() > env.course().finish_s, "finish line",
+        fmt("(score %.1f)", env.score()));
+}
+
+void benchmark(int threads) {
+  std::puts("benchmark (random actions on generated courses, new course every 8 episodes)");
   auto run = [&](int nthreads) {
     const int steps = 2000;  // control steps per thread
     std::vector<std::thread> pool;
+    std::vector<int> episodes(nthreads);
     const auto t0 = std::chrono::steady_clock::now();
     for (int k = 0; k < nthreads; ++k) {
       pool.emplace_back([&, k] {
-        Simulation sim(path);
+        EnvConfig cfg;
+        cfg.course.seed = 1000 * k + 1;
+        ParkourEnv env(cfg);
         std::mt19937 rng(k);
         std::uniform_real_distribution<double> u(-0.3, 0.3);
-        std::vector<double> act(sim.model()->nu);
+        std::vector<double> act(env.sim().model()->nu);
         std::vector<float> obs;
         for (int t = 0; t < steps; ++t) {
           for (double& x : act) x = u(rng);
-          if (!sim.step(act.data()) || t % 100 == 99) sim.reset();
-          sim.body_state().flatten(obs, 686.7);
+          if (env.step(act.data()).done) env.reset(), ++episodes[k];
+          env.sim().body_state().flatten(obs, 686.7);
         }
       });
     }
     for (auto& th : pool) th.join();
     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const double sps = nthreads * steps / sec;
-    std::printf("  %d thread(s): %8.0f control steps/s  (%5.1fx realtime, %.1f M steps/hour)\n",
-                nthreads, sps, sps * 0.02, sps * 3600 / 1e6);
+    int eps = 0;
+    for (int e : episodes) eps += e;
+    std::printf("  %d thread(s): %8.0f control steps/s  (%5.1fx realtime, %.1f M steps/hour, %d episodes)\n",
+                nthreads, sps, sps * 0.02, sps * 3600 / 1e6, eps);
   };
   run(1);
   if (threads > 1) run(threads);
@@ -259,7 +424,9 @@ int main(int argc, char** argv) {
   test_momentum_bookkeeping(sim);
   test_injuries(sim);
   test_joint_limits(sim);
-  benchmark(path, threads);
+  test_course_generation();
+  test_course_physics();
+  benchmark(threads);
   std::printf("%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures,
               failures == 1 ? "" : "s");
   return failures ? 1 : 0;

@@ -1,20 +1,25 @@
 // Interactive 3D viewer for the parkour humanoid.
-// Usage: parcour_viewer [scene.xml] [--screenshot out.ppm --at SECONDS]
+// Usage: parcour_viewer [--seed N] [--difficulty D] [--obstacles N] [--section K]
+//                       [--overview] [--screenshot out.ppm --at SECONDS]
+//        parcour_viewer scene.xml        (a fixed scene instead of generated courses)
 //
 // Shows the body, its centre of mass, momentum and angular momentum, and colours every
-// segment by the stress on the joint above it (skin -> red; magenta = broken).
-// Press H for the key list.
+// segment by the stress on the joint above it (skin -> red; magenta = broken). On generated
+// courses it also shows the route, progress and how the run ended. Press H for the key list.
 
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "core/controllers.h"
+#include "core/parkour_env.h"
 #include "core/simulation.h"
 
 using namespace parcour;
@@ -25,6 +30,10 @@ enum class Mode { kLimp, kHoldPose };
 
 struct App {
   Simulation* sim = nullptr;
+  std::unique_ptr<Simulation> fixed_scene;  // when a scene file is given
+  std::unique_ptr<ParkourEnv> env;          // generated courses otherwise
+  CourseParams course;
+  double start_s = -1;
   mjvCamera cam;
   mjvOption opt;
   mjvScene scn;
@@ -35,7 +44,7 @@ struct App {
   bool paused = false, step_once = false;
   bool grip = false, invincible = false;
   bool show_com = true, show_limbs = false, show_stress = true, show_help = false;
-  bool tracking = true;
+  bool tracking = true, show_route = true;
   double drop_height = 2.0;
 
   // mouse state
@@ -52,18 +61,67 @@ App app;
 
 const char* kHelp =
     "Space\nRight\nBackspace\nD\nM\nG\nI\nC\nL\nS\nT\n+ / -\n"
+    "N / P\n[ / ]\nJ / K\nR\nV\n"
     "Dbl-click\nCtrl+L drag\nCtrl+R drag\nH";
 const char* kHelpText =
-    "pause / run\nsingle step (paused)\nreset standing\ndrop from height\n"
+    "pause / run\nsingle step (paused)\nreset at start\ndrop from height\n"
     "mode: limp / hold pose\ngrip on / off\ninvincible (no breaking)\ncom + momentum\n"
     "per-limb momentum\nstress colours\ntrack camera\ndrop height\n"
+    "next / previous course\ndifficulty - / +\nstart at next / previous obstacle\n"
+    "route + progress\ncourse overview camera\n"
     "select body\nrotate body\npull body\nhelp";
 
 void reset(double lift) {
-  app.sim->reset(lift);
+  if (app.env) app.env->reset(lift, app.start_s);
+  else app.sim->reset(lift);
   app.sim_wall_offset = glfwGetTime() - app.sim->data()->time;
   mjv_defaultPerturb(&app.pert);
   app.pert.select = 0;
+}
+
+// Builds the course in app.course and rebuilds everything that depends on the model.
+void load_course() {
+  app.env->new_course(app.course);
+  const mjModel* m = app.sim->model();
+  mjv_freeScene(&app.scn);
+  mjv_makeScene(m, &app.scn, 4000);
+  mjr_freeContext(&app.con);
+  mjr_makeContext(m, &app.con, mjFONTSCALE_150);
+  app.start_s = -1;
+  reset(0.0);
+  app.paused = false;
+}
+
+// Free camera looking at the whole course from the side.
+void overview_camera() {
+  if (!app.env) return;
+  const Course& c = app.env->course();
+  Vec3 lo{1e9, 1e9, 1e9}, hi{-1e9, -1e9, -1e9};
+  for (const Section& s : c.sections) {
+    for (double u : {0.0, s.length}) {
+      const Vec3 p = s.to_world(u, 0, u > 0 ? s.level_out : s.level_in);
+      lo = {std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
+      hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
+    }
+  }
+  app.tracking = false;
+  app.cam.type = mjCAMERA_FREE;
+  ((lo + hi) * 0.5).to(app.cam.lookat);
+  app.cam.distance = 0.85 * std::max(hi.x - lo.x, hi.y - lo.y) + 4;
+  app.cam.azimuth = -60;
+  app.cam.elevation = -30;
+}
+
+// Moves the start to the approach of the next (+1) or previous (-1) obstacle.
+void jump_section(int dir) {
+  if (!app.env) return;
+  const Course& c = app.env->course();
+  const int n = int(c.sections.size());
+  const int cur = app.start_s < 0 ? 0 : c.section_at(app.start_s);
+  const int next = std::clamp(cur + dir, 0, n - 1);
+  app.start_s = next == 0 ? -1 : c.sections[next].s0 + 0.5;
+  reset(0.0);
+  app.paused = false;
 }
 
 void apply_controller() {
@@ -105,6 +163,7 @@ void physics() {
       break;
     }
   }
+  if (app.env) app.env->evaluate();
   if (d->time < target && !app.step_once) app.sim_wall_offset = wall - d->time;  // drop lag
   app.step_once = false;
   const double dt_wall = std::max(wall - app.last_wall, 1e-3);
@@ -171,12 +230,44 @@ void decorate() {
     }
   }
 
+  if (app.env && app.show_route) {
+    const Course& c = app.env->course();
+    const float white[4] = {1, 1, 1, 0.8}, green[4] = {0.2, 1, 0.3, 1}, gold[4] = {1, 0.8, 0.1, 1};
+    for (const Section& sec : c.sections) {
+      // centreline over the flat parts (approach and runout) of every section
+      add_line(sec.to_world(0, 0, sec.level_in + 0.01),
+               sec.to_world(sec.obstacle_start, 0, sec.level_in + 0.01), white);
+      add_line(sec.to_world(sec.obstacle_end, 0, sec.level_out + 0.01),
+               sec.to_world(sec.length, 0, sec.level_out + 0.01), white);
+      // checkpoint at the end of every section, green once reached
+      const bool reached = app.env->best_progress() >= sec.s0 + sec.length;
+      const Vec3 cp = sec.to_world(sec.length, 0, sec.level_out);
+      add_line(cp, cp + Vec3{0, 0, 0.6}, reached ? green : white);
+      add_sphere(cp + Vec3{0, 0, 0.6}, 0.04, reached ? green : white);
+    }
+    const Section& last = c.sections.back();
+    const double w = c.params.width / 2, uf = c.finish_s - last.s0;
+    add_line(last.to_world(uf, -w, last.level_out + 0.01), last.to_world(uf, w, last.level_out + 0.01),
+             gold);
+    // best progress so far
+    const double best = app.env->best_progress();
+    const Section& bs = c.sections[c.section_at(best)];
+    const Vec3 bp = bs.to_world(best - bs.s0, 0, std::max(bs.level_in, bs.level_out) + 0.03);
+    add_sphere(bp, 0.05, gold);
+  }
+
   if (app.show_com) {
     const float red[4] = {1, 0.2, 0.2, 1}, yellow[4] = {1, 0.85, 0.1, 1},
                 blue[4] = {0.2, 0.5, 1, 1}, grey[4] = {1, 0.2, 0.2, 0.6};
     add_sphere(s.com, 0.035, red);
-    add_line(s.com, {s.com.x, s.com.y, 0}, grey);
-    add_sphere({s.com.x, s.com.y, 0.003}, 0.02, grey);
+    // ground projection onto the floor under the com (z = 0 in a fixed scene)
+    double ground = 0;
+    if (app.env) {
+      const Section& sec = app.env->course().sections[app.env->section()];
+      ground = s.com.z > sec.level_out - 0.3 ? sec.level_out : sec.level_in;
+    }
+    add_line(s.com, {s.com.x, s.com.y, ground}, grey);
+    add_sphere({s.com.x, s.com.y, ground + 0.003}, 0.02, grey);
     add_arrow(s.com, s.momentum * 0.005, 0.02, yellow);    // 1 m per 200 kg m/s
     add_arrow(s.com, s.ang_momentum * 0.05, 0.02, blue);   // 1 m per 20 kg m^2/s
   }
@@ -206,12 +297,28 @@ void overlay(mjrRect vp) {
                 app.grip ? "closed" : "open", s.com.z, s.com_vel.norm(), s.momentum.norm(),
                 s.ang_momentum.norm(), 100 * inj.loads()[worst].stress,
                 InjuryMonitor::joint_name(worst).c_str());
+  if (app.env) {
+    const ParkourEnv& e = *app.env;
+    const Course& c = e.course();
+    char l2[160], r2[320];
+    std::snprintf(l2, sizeof(l2), "\ncourse\nsection\nprogress\nscore");
+    std::snprintf(r2, sizeof(r2), "\nseed %llu, difficulty %.1f\n%d / %d  %s\n%.1f / %.1f m\n%.1f",
+                  (unsigned long long)c.params.seed, c.params.difficulty, e.section() + 1,
+                  int(c.sections.size()), obstacle_name(c.sections[e.section()].type),
+                  e.best_progress(), c.finish_s, e.score());
+    std::strncat(left, l2, sizeof(left) - std::strlen(left) - 1);
+    std::strncat(right, r2, sizeof(right) - std::strlen(right) - 1);
+  }
   mjr_overlay(mjFONT_NORMAL, mjGRID_TOPLEFT, vp, left, right, &app.con);
 
   if (inj.broken_segment() >= 0) {
     std::string msg = "JOINT BROKEN: " + InjuryMonitor::joint_name(inj.broken_segment());
     mjr_overlay(mjFONT_BIG, mjGRID_TOP, vp, msg.c_str(),
                 app.invincible ? nullptr : "Backspace = reset, I = continue invincible", &app.con);
+  } else if (app.env && app.env->end_reason() != EndReason::kNone) {
+    std::string msg = end_reason_name(app.env->end_reason());
+    for (char& ch : msg) ch = char(std::toupper(ch));
+    mjr_overlay(mjFONT_BIG, mjGRID_TOP, vp, msg.c_str(), "Backspace = restart", &app.con);
   }
   if (app.show_help) {
     mjr_overlay(mjFONT_NORMAL, mjGRID_TOPRIGHT, vp, kHelp, kHelpText, &app.con);
@@ -247,6 +354,23 @@ void on_key(GLFWwindow*, int key, int, int act, int) {
     case GLFW_KEY_MINUS: case GLFW_KEY_KP_SUBTRACT:
       app.drop_height = std::max(0.0, app.drop_height - 0.5);
       break;
+    case GLFW_KEY_N: case GLFW_KEY_P:
+      if (app.env) {
+        app.course.seed = key == GLFW_KEY_N ? app.course.seed + 1 : std::max<uint64_t>(1, app.course.seed - 1);
+        load_course();
+      }
+      break;
+    case GLFW_KEY_LEFT_BRACKET: case GLFW_KEY_RIGHT_BRACKET:
+      if (app.env) {
+        const double step = key == GLFW_KEY_RIGHT_BRACKET ? 0.1 : -0.1;
+        app.course.difficulty = std::clamp(std::round((app.course.difficulty + step) * 10) / 10, 0.0, 1.0);
+        load_course();
+      }
+      break;
+    case GLFW_KEY_J: jump_section(+1); break;
+    case GLFW_KEY_K: jump_section(-1); break;
+    case GLFW_KEY_R: app.show_route = !app.show_route; break;
+    case GLFW_KEY_V: overview_camera(); break;
     default: break;
   }
 }
@@ -328,17 +452,33 @@ void save_ppm(const char* file, mjrRect vp) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string path = std::string(PARCOUR_ASSET_DIR) + "/scene_flat.xml";
+  std::string path;
   const char* screenshot = nullptr;
   double shot_time = 0;
+  bool overview = false;
+  int start_section = 0;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--screenshot") && i + 1 < argc) screenshot = argv[++i];
     else if (!std::strcmp(argv[i], "--at") && i + 1 < argc) shot_time = std::atof(argv[++i]);
+    else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) app.course.seed = std::stoull(argv[++i]);
+    else if (!std::strcmp(argv[i], "--difficulty") && i + 1 < argc) app.course.difficulty = std::atof(argv[++i]);
+    else if (!std::strcmp(argv[i], "--obstacles") && i + 1 < argc) app.course.num_obstacles = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--section") && i + 1 < argc) start_section = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--overview")) overview = true;
     else path = argv[i];
   }
-  Simulation sim(path);
-  app.sim = &sim;
-  const mjModel* m = sim.model();
+  if (path.empty()) {
+    EnvConfig cfg;
+    cfg.course = app.course;
+    cfg.episodes_per_course = 1 << 30;  // the viewer changes courses only on request
+    cfg.stall_time = cfg.time_limit = 1e9;
+    app.env = std::make_unique<ParkourEnv>(cfg);
+    app.sim = &app.env->sim();
+    for (int k = 0; k < start_section; ++k) jump_section(+1);
+  } else {
+    app.fixed_scene = std::make_unique<Simulation>(path);
+    app.sim = app.fixed_scene.get();
+  }
 
   if (!glfwInit()) {
     std::fprintf(stderr, "could not initialise GLFW (is a display available?)\n");
@@ -358,11 +498,11 @@ int main(int argc, char** argv) {
   mjv_defaultScene(&app.scn);
   mjr_defaultContext(&app.con);
   mjv_defaultPerturb(&app.pert);
-  mjv_makeScene(m, &app.scn, 4000);
-  mjr_makeContext(m, &app.con, mjFONTSCALE_150);
+  mjv_makeScene(app.sim->model(), &app.scn, 4000);
+  mjr_makeContext(app.sim->model(), &app.con, mjFONTSCALE_150);
 
   app.cam.type = mjCAMERA_TRACKING;
-  app.cam.trackbodyid = sim.layout().root_body;
+  app.cam.trackbodyid = app.sim->layout().root_body;
   app.cam.distance = 4.0;
   app.cam.azimuth = 120;
   app.cam.elevation = -15;
@@ -373,15 +513,17 @@ int main(int argc, char** argv) {
   glfwSetScrollCallback(window, on_scroll);
 
   reset(0.0);
+  if (overview) overview_camera();
   while (!glfwWindowShouldClose(window)) {
     physics();
     mjrRect vp = {0, 0, 0, 0};
     glfwGetFramebufferSize(window, &vp.width, &vp.height);
-    mjv_updateScene(m, sim.data(), &app.opt, &app.pert, &app.cam, mjCAT_ALL, &app.scn);
+    mjv_updateScene(app.sim->model(), app.sim->data(), &app.opt, &app.pert, &app.cam, mjCAT_ALL,
+                    &app.scn);
     decorate();
     mjr_render(vp, &app.scn, &app.con);
     overlay(vp);
-    if (screenshot && sim.data()->time >= shot_time) {
+    if (screenshot && app.sim->data()->time >= shot_time) {
       save_ppm(screenshot, vp);
       break;
     }
