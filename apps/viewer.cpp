@@ -1,11 +1,12 @@
 // Interactive 3D viewer for the parkour humanoid.
 // Usage: parcour_viewer [--seed N] [--difficulty D] [--obstacles N] [--section K]
-//                       [--overview] [--screenshot out.ppm --at SECONDS]
+//                       [--overview] [--vision] [--screenshot out.ppm --at SECONDS]
 //        parcour_viewer scene.xml        (a fixed scene instead of generated courses)
 //
 // Shows the body, its centre of mass, momentum and angular momentum, and colours every
 // segment by the stress on the joint above it (skin -> red; magenta = broken). On generated
-// courses it also shows the route, progress and how the run ended. Press H for the key list.
+// courses it also shows the route, progress, how the run ended and what the bot perceives
+// (rays coloured by obstacle type, upcoming obstacles). Press H for the key list.
 
 #include <GLFW/glfw3.h>
 
@@ -44,7 +45,8 @@ struct App {
   bool paused = false, step_once = false;
   bool grip = false, invincible = false;
   bool show_com = true, show_limbs = false, show_stress = true, show_help = false;
-  bool tracking = true, show_route = true;
+  bool tracking = true, show_route = true, show_vision = false;
+  std::vector<float> obs;  // policy input, recomputed every frame for the vision overlay
   double drop_height = 2.0;
 
   // mouse state
@@ -61,14 +63,14 @@ App app;
 
 const char* kHelp =
     "Space\nRight\nBackspace\nD\nM\nG\nI\nC\nL\nS\nT\n+ / -\n"
-    "N / P\n[ / ]\nJ / K\nR\nV\n"
+    "N / P\n[ / ]\nJ / K\nR\nY\nV\n"
     "Dbl-click\nCtrl+L drag\nCtrl+R drag\nH";
 const char* kHelpText =
     "pause / run\nsingle step (paused)\nreset at start\ndrop from height\n"
     "mode: limp / hold pose\ngrip on / off\ninvincible (no breaking)\ncom + momentum\n"
     "per-limb momentum\nstress colours\ntrack camera\ndrop height\n"
     "next / previous course\ndifficulty - / +\nstart at next / previous obstacle\n"
-    "route + progress\ncourse overview camera\n"
+    "route + progress\nvision: rays + next obstacles\ncourse overview camera\n"
     "select body\nrotate body\npull body\nhelp";
 
 void reset(double lift) {
@@ -205,6 +207,55 @@ void add_line(const Vec3& from, const Vec3& to, const float rgba[4]) {
   g->category = mjCAT_DECOR;
 }
 
+void add_box(const Vec3& centre, const Vec3& half, double yaw, const float rgba[4]) {
+  if (app.scn.ngeom >= app.scn.maxgeom) return;
+  mjvGeom* g = app.scn.geoms + app.scn.ngeom++;
+  const double c = std::cos(yaw), s = std::sin(yaw);
+  const double mat[9] = {c, -s, 0, s, c, 0, 0, 0, 1};
+  double size[3], pos[3];
+  half.to(size);
+  centre.to(pos);
+  mjv_initGeom(g, mjGEOM_BOX, size, pos, mat, rgba);
+  g->category = mjCAT_DECOR;
+}
+
+// bright colour per obstacle type for the vision overlay
+const float kTypeColour[kNumObstacleTypes][4] = {
+    {0.85, 0.85, 0.85, 1}, {1.0, 0.9, 0.1, 1}, {1.0, 0.5, 0.0, 1}, {1.0, 0.15, 0.15, 1},
+    {0.9, 0.2, 0.9, 1},    {0.1, 0.9, 0.9, 1}, {0.2, 0.45, 1.0, 1}};
+
+void decorate_vision() {
+  app.env->observe(app.obs);  // casts the rays
+  const ParkourEnv& e = *app.env;
+  const Perception& p = e.perception();
+  for (const RayHit& h : p.hits()) {
+    if (h.piece < 0) continue;  // nothing within range
+    const Vec3 hit = p.eye() + h.dir * h.dist;
+    float c[4];
+    std::copy(kTypeColour[int(h.type)], kTypeColour[int(h.type)] + 4, c);
+    c[3] = 0.5f;
+    add_line(p.eye(), hit, c);
+    add_sphere(hit, 0.025, kTypeColour[int(h.type)]);
+  }
+  // key pieces of the upcoming obstacles: the next one brightest
+  const Course& c = e.course();
+  const std::vector<int> next = upcoming_obstacles(c, e.progress(), p.config().lookahead);
+  for (size_t k = 0; k < next.size(); ++k) {
+    const Section& sec = c.sections[next[k]];
+    float col[4];
+    std::copy(kTypeColour[int(sec.type)], kTypeColour[int(sec.type)] + 4, col);
+    col[3] = k == 0 ? 0.45f : 0.2f;
+    for (int i : key_pieces(c, next[k], p.config().key_pieces)) {
+      const Piece& pc = c.pieces[i];
+      // grow the box a little so it shows around the piece; clip pillars at 1 m deep
+      const Vec3 lo{pc.lo.x - 0.02, pc.lo.y - 0.02, std::max(pc.lo.z, pc.hi.z - 1.0)};
+      const Vec3 hi{pc.hi.x + 0.02, pc.hi.y + 0.02, pc.hi.z + 0.02};
+      const Vec3 mid = (lo + hi) * 0.5;
+      add_box(sec.to_world(mid.x, mid.y, mid.z), (hi - lo) * 0.5, sec.yaw, col);
+    }
+  }
+}
+
 void decorate() {
   const mjModel* m = app.sim->model();
   const auto& layout = app.sim->layout();
@@ -255,6 +306,8 @@ void decorate() {
     const Vec3 bp = bs.to_world(best - bs.s0, 0, std::max(bs.level_in, bs.level_out) + 0.03);
     add_sphere(bp, 0.05, gold);
   }
+
+  if (app.env && app.show_vision) decorate_vision();
 
   if (app.show_com) {
     const float red[4] = {1, 0.2, 0.2, 1}, yellow[4] = {1, 0.85, 0.1, 1},
@@ -308,6 +361,21 @@ void overlay(mjrRect vp) {
                   e.best_progress(), c.finish_s, e.score());
     std::strncat(left, l2, sizeof(left) - std::strlen(left) - 1);
     std::strncat(right, r2, sizeof(right) - std::strlen(right) - 1);
+    if (app.show_vision) {
+      std::string next;
+      for (int i : upcoming_obstacles(c, e.progress(), e.perception().config().lookahead)) {
+        const Section& sec = c.sections[i];
+        char item[64];
+        std::snprintf(item, sizeof(item), "%s%s %.1f m", next.empty() ? "" : ", ",
+                      obstacle_name(sec.type), std::max(0.0, sec.s0 + sec.obstacle_start - e.progress()));
+        next += item;
+      }
+      char l3[32], r3[160];
+      std::snprintf(l3, sizeof(l3), "\nnext");
+      std::snprintf(r3, sizeof(r3), "\n%s", next.empty() ? "finish" : next.c_str());
+      std::strncat(left, l3, sizeof(left) - std::strlen(left) - 1);
+      std::strncat(right, r3, sizeof(right) - std::strlen(right) - 1);
+    }
   }
   mjr_overlay(mjFONT_NORMAL, mjGRID_TOPLEFT, vp, left, right, &app.con);
 
@@ -370,6 +438,7 @@ void on_key(GLFWwindow*, int key, int, int act, int) {
     case GLFW_KEY_J: jump_section(+1); break;
     case GLFW_KEY_K: jump_section(-1); break;
     case GLFW_KEY_R: app.show_route = !app.show_route; break;
+    case GLFW_KEY_Y: app.show_vision = !app.show_vision; break;
     case GLFW_KEY_V: overview_camera(); break;
     default: break;
   }
@@ -465,6 +534,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--obstacles") && i + 1 < argc) app.course.num_obstacles = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--section") && i + 1 < argc) start_section = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--overview")) overview = true;
+    else if (!std::strcmp(argv[i], "--vision")) app.show_vision = true;
     else path = argv[i];
   }
   if (path.empty()) {

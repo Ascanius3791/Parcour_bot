@@ -6,6 +6,7 @@
 #include <string>
 
 #include "core/course.h"
+#include "core/perception.h"
 #include "core/simulation.h"
 
 namespace parcour {
@@ -30,6 +31,8 @@ struct EnvConfig {
   double w_time = 0.0;
   double finish_bonus = 10.0;
   double fail_penalty = 0.0;
+
+  PerceptionConfig perception;
 };
 
 struct StepResult {
@@ -56,10 +59,16 @@ class ParkourEnv {
   // Useful when the simulation is advanced by other means (the viewer).
   StepResult evaluate();
 
+  // Policy input for the current state: body sensors (BodyState::flatten), ray scan,
+  // upcoming obstacles and route hints, in that order. Casts the rays.
+  void observe(std::vector<float>& out);
+  int obs_size() const;
+
   Simulation& sim() { return *sim_; }
   const Course& course() const { return course_; }
   const EnvConfig& config() const { return cfg_; }
   int first_course_geom() const { return first_geom_; }  // course piece i = this geom id + i
+  const Perception& perception() const { return perception_; }  // as of the last observe()
 
   double time() const;
   double time_limit() const;
@@ -79,6 +88,7 @@ class ParkourEnv {
   std::unique_ptr<Simulation> sim_;
   Course course_;
   int first_geom_ = -1;
+  Perception perception_;
   int episodes_on_course_ = 0;
   uint64_t next_seed_ = 0;
 

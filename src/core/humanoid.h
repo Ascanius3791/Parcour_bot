@@ -15,6 +15,7 @@ inline constexpr const char* kSegmentNames[] = {
     "thigh_l",     "shank_l",   "foot_l", "toes_l",
     "thigh_r",     "shank_r",   "foot_r", "toes_r"};
 inline constexpr int kNumSegments = sizeof(kSegmentNames) / sizeof(kSegmentNames[0]);
+inline constexpr int kHead = 3;  // index of "head" in kSegmentNames
 
 class HumanoidLayout {
  public:

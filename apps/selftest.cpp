@@ -374,8 +374,102 @@ void test_course_physics() {
         fmt("(score %.1f)", env.score()));
 }
 
+// Section coordinates (u, v, z) of a world point.
+Vec3 to_section(const Section& sec, const Vec3& p) {
+  const double c = std::cos(sec.yaw), s = std::sin(sec.yaw);
+  const double dx = p.x - sec.origin.x, dy = p.y - sec.origin.y;
+  return {c * dx + s * dy, -s * dx + c * dy, p.z};
+}
+
+void test_perception() {
+  std::puts("perception");
+  EnvConfig cfg;
+  cfg.episodes_per_course = 1000000;
+  ParkourEnv env(cfg);
+  std::vector<float> obs;
+  env.observe(obs);
+  const int body = BodyState::flat_size(int(env.sim().layout().actuated_joints.size()));
+  const Perception& per = env.perception();
+  std::printf("  %d rays, observation %d = body %d + rays %d + next obstacles %d + route %d\n",
+              per.num_rays(), env.obs_size(), body, per.rays_size(), per.lookahead_size(),
+              per.route_size());
+  check(int(obs.size()) == env.obs_size(), "observation size", fmt("(%.0f)", obs.size()));
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int k = 0; k < 2000; ++k) env.observe(obs);
+  std::printf("  observe() %.0f us\n",
+              std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 2000);
+
+  // the steepest forward ray from the head hits the runway at the expected distance
+  const Vec3 eye = per.eye();
+  const auto& el = per.config().elevation_deg;
+  const auto& az = per.config().azimuth_deg;
+  const int down = int(std::min_element(el.begin(), el.end()) - el.begin());
+  const int ahead = int(std::find(az.begin(), az.end(), 0.0) - az.begin());
+  const RayHit& h = per.hits()[down * az.size() + ahead];
+  const double expect = (eye.z - env.course().sections[0].level_in) / std::sin(-el[down] * M_PI / 180);
+  check(h.piece >= 0 && h.type == Obstacle::kFloor && std::fabs(h.dist - expect) < 0.01,
+        "downward ray hits the runway", fmt("(%.3f m, expected %.3f m)", h.dist, expect));
+
+  // From in front of every obstacle of many courses: each hit lies on the box of the piece it
+  // reports, the normal faces the ray, and every obstacle type gets seen.
+  int seen[kNumObstacleTypes] = {}, hits = 0, bad_point = 0, bad_normal = 0, bad_obs = 0;
+  int wrong_next = 0, scans = 0;
+  for (uint64_t seed = 1; seed <= 12; ++seed) {
+    CourseParams p;
+    p.seed = seed;
+    p.difficulty = (seed % 3) * 0.5;
+    env.new_course(p);
+    const Course& c = env.course();
+    for (size_t i = 0; i < c.sections.size(); ++i) {
+      const Section& sec = c.sections[i];
+      if (sec.type == Obstacle::kFloor) continue;
+      env.reset();
+      env.sim().reset_at(sec.to_world(sec.obstacle_start - 1.0, 0, sec.level_in), sec.yaw);
+      env.observe(obs);
+      ++scans;
+      for (float x : obs) bad_obs += !std::isfinite(x);
+      // next obstacle in the list is this one, about 1 m ahead (the com is not exactly at u)
+      const RoutePoint rp = c.project(env.sim().body_state().com);
+      const std::vector<int> next = upcoming_obstacles(c, rp.s, 3);
+      wrong_next += next.empty() || next[0] != int(i) ||
+                    std::fabs(sec.s0 + sec.obstacle_start - rp.s - 1.0) > 0.2;
+      for (const RayHit& r : per.hits()) {
+        if (r.piece < 0) continue;
+        ++hits;
+        const Piece& pc = c.pieces[r.piece];
+        ++seen[int(pc.type)];
+        const Vec3 q = to_section(c.sections[pc.section], per.eye() + r.dir * r.dist);
+        const double tol = 1e-3;
+        const bool inside = q.x > pc.lo.x - tol && q.x < pc.hi.x + tol && q.y > pc.lo.y - tol &&
+                            q.y < pc.hi.y + tol && q.z > pc.lo.z - tol && q.z < pc.hi.z + tol;
+        const bool on_face = pc.shape != mjGEOM_BOX || std::fabs(q.x - pc.lo.x) < tol ||
+                             std::fabs(q.x - pc.hi.x) < tol || std::fabs(q.y - pc.lo.y) < tol ||
+                             std::fabs(q.y - pc.hi.y) < tol || std::fabs(q.z - pc.lo.z) < tol ||
+                             std::fabs(q.z - pc.hi.z) < tol;
+        bad_point += !(inside && on_face);
+        bad_normal += !(std::fabs(r.normal.norm() - 1) < 1e-6 && r.normal.dot(r.dir) < 0);
+      }
+    }
+  }
+  std::printf("  %d scans, %d hits:", scans, hits);
+  for (int t = 0; t < kNumObstacleTypes; ++t) std::printf(" %s %d", obstacle_name(Obstacle(t)), seen[t]);
+  std::puts("");
+  bool all_seen = true;
+  for (int t = 0; t < kNumObstacleTypes; ++t) all_seen &= seen[t] > 0;
+  check(all_seen, "rays see every obstacle type");
+  check(bad_point == 0, "hit points lie on the surface of the reported piece",
+        fmt("(%.0f wrong)", bad_point));
+  check(bad_normal == 0, "surface normals are unit vectors facing the ray", fmt("(%.0f wrong)", bad_normal));
+  check(bad_obs == 0, "observation is finite");
+  check(wrong_next == 0, "next obstacle in the list is the one ahead", fmt("(%.0f wrong)", wrong_next));
+
+  // past the last obstacle the list is empty
+  const Course& c = env.course();
+  check(upcoming_obstacles(c, c.finish_s, 3).empty(), "no obstacles listed after the last one");
+}
+
 void benchmark(int threads) {
-  std::puts("benchmark (random actions on generated courses, new course every 8 episodes)");
+  std::puts("benchmark (random actions + full observation on generated courses, new course every 8 episodes)");
   auto run = [&](int nthreads) {
     const int steps = 2000;  // control steps per thread
     std::vector<std::thread> pool;
@@ -393,7 +487,7 @@ void benchmark(int threads) {
         for (int t = 0; t < steps; ++t) {
           for (double& x : act) x = u(rng);
           if (env.step(act.data()).done) env.reset(), ++episodes[k];
-          env.sim().body_state().flatten(obs, 686.7);
+          env.observe(obs);
         }
       });
     }
@@ -426,6 +520,7 @@ int main(int argc, char** argv) {
   test_joint_limits(sim);
   test_course_generation();
   test_course_physics();
+  test_perception();
   benchmark(threads);
   std::printf("%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures,
               failures == 1 ? "" : "s");

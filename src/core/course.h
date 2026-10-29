@@ -48,6 +48,10 @@ struct Piece {
   Vec3 pos;                    // world position of the centre
   double quat[4] = {1, 0, 0, 0};
   Vec3 size;                   // MuJoCo geom size (box: half extents)
+  // bounding box in section coordinates (u forward, v left, absolute z); every piece is
+  // aligned with its section, so this describes it exactly (bars: the capsule's box)
+  Vec3 lo, hi;
+  bool support = false;        // only holds something up (bar posts): not a key piece
 };
 
 struct Section {

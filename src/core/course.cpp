@@ -51,7 +51,13 @@ class SectionBuilder {
     p.pos = sec_.to_world(0.5 * (u0 + u1), 0.5 * (v0 + v1), 0.5 * (z0 + z1));
     yaw_quat(sec_.yaw, p.quat);
     p.size = {0.5 * (u1 - u0), 0.5 * (v1 - v0), 0.5 * (z1 - z0)};
+    p.lo = {u0, v0, z0};
+    p.hi = {u1, v1, z1};
     c_.pieces.push_back(p);
+  }
+  void support(double u0, double u1, double v0, double v1, double z0, double z1) {
+    box(sec_.type, u0, u1, v0, v1, z0, z1);
+    c_.pieces.back().support = true;
   }
   // floor slab across the full corridor width, top at z
   void floor(double u0, double u1, double z, Obstacle type = Obstacle::kFloor) {
@@ -70,6 +76,8 @@ class SectionBuilder {
     yaw_quat(sec_.yaw, qy);
     mju_mulQuat(p.quat, qy, qx);
     p.size = {radius, half_len, 0};
+    p.lo = {u - radius, -half_len - radius, z - radius};
+    p.hi = {u + radius, half_len + radius, z + radius};
     c_.pieces.push_back(p);
   }
 
@@ -195,8 +203,7 @@ void make_bars(Course& c, int i, Rng& r, double d, double approach, double runou
     const double u = approach + edge + k * spacing;
     b.bar(u, z, radius, post_v);
     for (double side : {-1.0, 1.0}) {  // posts rise from the abyss outside the corridor
-      b.box(Obstacle::kBar, u - 0.05, u + 0.05, side * post_v - 0.05, side * post_v + 0.05,
-            kAbyss, z);
+      b.support(u - 0.05, u + 0.05, side * post_v - 0.05, side * post_v + 0.05, kAbyss, z);
     }
   }
   b.floor(s.obstacle_end, s.length, s.level_in);
@@ -279,6 +286,8 @@ Course generate_course(const CourseParams& params) {
         pad.shape = mjGEOM_CYLINDER;
         pad.pos = {at.x, at.y, at.z - 0.002 - kSlab / 2};  // just below the slabs: no z-fighting
         pad.size = {params.width / 2, kSlab / 2, 0};
+        pad.lo = {-params.width / 2, -params.width / 2, at.z - 0.002 - kSlab};
+        pad.hi = {params.width / 2, params.width / 2, at.z - 0.002};
         c.pieces.push_back(pad);
       }
     }

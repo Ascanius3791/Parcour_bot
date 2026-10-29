@@ -19,7 +19,7 @@ const char* end_reason_name(EndReason r) {
 }
 
 ParkourEnv::ParkourEnv(EnvConfig cfg, const std::string& base_scene)
-    : cfg_(cfg), next_seed_(cfg.course.seed) {
+    : cfg_(cfg), perception_(cfg.perception), next_seed_(cfg.course.seed) {
   char err[1024] = "";
   base_ = mj_parseXML(base_scene.c_str(), nullptr, err, sizeof(err));
   if (!base_) throw std::runtime_error("failed to parse " + base_scene + ": " + err);
@@ -108,6 +108,21 @@ StepResult ParkourEnv::evaluate() {
   r.done = reason_ != EndReason::kNone;
   r.reason = reason_;
   return r;
+}
+
+void ParkourEnv::observe(std::vector<float>& out) {
+  const BodyState& s = sim_->body_state();
+  s.flatten(out, sim_->layout().total_mass * -sim_->model()->opt.gravity[2]);
+  const Vec3 eye = s.com + s.limbs[kHead].pos;
+  perception_.scan(sim_->model(), sim_->data(), course_, first_geom_, eye, s.yaw);
+  perception_.append_rays(out);
+  const RoutePoint rp = course_.project(s.com);
+  append_lookahead(cfg_.perception, course_, rp, s.com, s.yaw, out);
+  append_route(cfg_.perception, course_, rp, s.com, s.yaw, time_limit() - time(), out);
+}
+
+int ParkourEnv::obs_size() const {
+  return BodyState::flat_size(int(sim_->layout().actuated_joints.size())) + perception_.size();
 }
 
 int ParkourEnv::sections_cleared() const {

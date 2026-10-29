@@ -18,7 +18,8 @@ build/parcour_viewer                  # interactive 3D viewer on a generated cou
 ```
 
 Viewer options: `--seed N`, `--difficulty 0..1`, `--obstacles N`, `--section K`
-(start at the K-th section), `--overview` (camera on the whole course). Pass a
+(start at the K-th section), `--overview` (camera on the whole course),
+`--vision` (show what the bot perceives). Pass a
 scene file instead, e.g. `build/parcour_viewer assets/scene_flat.xml`, to get the
 plain floor.
 
@@ -42,6 +43,7 @@ without it via `-DPARCOUR_BUILD_VIEWER=OFF`.
 | J / K | start at the next / previous obstacle |
 | V | camera overview of the whole course |
 | R | route, checkpoints and progress marker |
+| Y | vision: the bot's rays (coloured by obstacle type) and its next obstacles |
 | Mouse | left drag rotate, right drag pan, scroll zoom |
 | Double-click, then Ctrl+drag | select a body, then rotate (left) or pull (right) it |
 
@@ -83,8 +85,27 @@ whole-body centre of mass, its velocity, total linear and angular momentum; for
 each segment its position relative to the com, orientation, angular velocity,
 linear momentum and angular momentum about the com; joint angles and
 velocities, grip state, foot contact forces, head accelerometer/gyro and joint
-stress. `BodyState::flatten` turns this into a 438-value, heading-invariant
-policy input.
+stress. `BodyState::flatten` turns this into 438 heading-invariant values.
+
+### Perception of the course
+
+[`src/core/perception.h`](src/core/perception.h) adds what the bot sees:
+
+* **99 rays** from the head in a fan (9 directions from 60° left to 60° right ×
+  11 angles from 50° up to 78° down) that turns with the body. Each ray reports
+  its distance (up to 10 m), the type of obstacle it hit (floor, stairs, hurdle,
+  wall, beam, bars, platform) and the surface normal, i.e. the angle of the
+  surface. Rays only see the course, not the bot's own body.
+* **The next 3 obstacles**: type, how far ahead they start and end, their
+  heading, the floor level before and after, and the boxes of up to 4 key pieces
+  (the hurdle, the wall parts around the hole, the beam, the bars, the platform
+  tops, the first steps) relative to the body.
+* **Route hints**: sideways offset from the centreline, the centreline 1, 2 and
+  4 m ahead, distance to the finish and time left.
+
+`ParkourEnv::observe` returns the full policy input: 1652 values (438 body +
+1089 rays + 111 obstacles + 14 route). The rays take about 65 µs per control
+step, ~4% of the physics cost.
 
 ## Obstacle courses
 
@@ -103,7 +124,7 @@ leaving it sideways or missing a jump is a fall.
 | Platforms (pillars with gaps) | 2 pillars, 20–30 cm gaps, steps of −0.3 to +0.2 m | up to 4 narrower pillars, gaps up to 1.5 m, steps of −0.8 to +1 m |
 
 The same seed always gives the same course, on every machine. Every piece is
-tagged with its obstacle type and section (for the bot's perception later).
+tagged with its obstacle type and section, which the rays report.
 
 [`src/core/parkour_env.h`](src/core/parkour_env.h) wraps a simulation and a course
 into a training environment. Progress is the distance along the route of the
@@ -118,7 +139,7 @@ finishes. Building a course takes ~20 ms, so each one is reused for 8 episodes.
 ```
 assets/        MJCF models and scenes (humanoid.xml is generated)
 tools/         model generators (Python)
-src/core/      C++ core: simulation, sensors, injury model
+src/core/      C++ core: simulation, sensors, injury model, courses, perception, env
 apps/          viewer and self-test executables
 scripts/       dependency setup
 ```
@@ -127,6 +148,6 @@ scripts/       dependency setup
 
 1. ~~Humanoid, joint limits, injuries, sensors, viewer~~
 2. ~~Procedural obstacle course generator + route scoring~~
-3. Environment observations of the surroundings (rays reporting obstacle type and pose)
+3. ~~Perception of the surroundings (rays reporting obstacle type and surface angle, next obstacles)~~
 4. Training (PPO) on CPU threads and GitHub runners: standing → walking → running
 5. Stairs, platforms, hurdles → wall holes → swing bars

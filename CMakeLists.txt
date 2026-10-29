@@ -30,6 +30,7 @@ add_library(parcour_core
   src/core/body_state.cpp
   src/core/simulation.cpp
   src/core/course.cpp
+  src/core/perception.cpp
   src/core/parkour_env.cpp)
 target_include_directories(parcour_core PUBLIC src)
 target_link_libraries(parcour_core PUBLIC mujoco)
