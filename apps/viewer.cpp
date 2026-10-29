@@ -721,6 +721,13 @@ int main(int argc, char** argv) {
       app.course.num_obstacles = int(app.policy->meta_num("course_num_obstacles", app.course.num_obstacles));
       app.course.finish_length = app.policy->meta_num("course_finish_length", app.course.finish_length);
       app.course.difficulty = app.policy->meta_num("course_difficulty", app.course.difficulty);
+      const auto allowed = app.policy->meta().find("course_allowed");  // e.g. "stairs,hurdle"
+      if (allowed != app.policy->meta().end()) {
+        const std::string list = "," + allowed->second + ",";
+        for (int t = 1; t < kNumObstacleTypes; ++t) {
+          app.course.allowed[t] = list.find("," + std::string(obstacle_name(Obstacle(t))) + ",") != std::string::npos;
+        }
+      }
     }
     if (!path.empty()) {
       std::fprintf(stderr, "--policy needs a generated course, not a scene file\n");

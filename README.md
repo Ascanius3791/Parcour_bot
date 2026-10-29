@@ -184,9 +184,18 @@ the Python module `parcour` ([`python/bindings.cpp`](python/bindings.cpp)), with
   | stand | stay up for 10 s on a flat track | 1 per second alive | 90% of the time survived |
   | walk | reach the end of 30 m within 45 s | 1 per metre, 0.5 per second, 5 at the finish | 70% finish |
   | run | 30 m within 25 s | 1 per metre, 1 per second left at the finish | 70% finish at 3 m/s |
+  | terrain | 3 obstacles: stairs, hurdles, platforms | 1 per metre, 5 at the finish, 0.3 per second left | difficulty 0.5, 60% finish |
+  | beam | 4 obstacles, adds balance beams | as above | difficulty 0.5, 60% finish |
+  | wall | 4 obstacles, adds walls with a hole | as above | difficulty 0.5, 60% finish |
+  | bars | 5 obstacles, adds swing bars | as above | difficulty 0.5, 60% finish |
+  | parkour | 6 obstacles of every kind | as above | difficulty 1, 50% finish |
 
   A run also ends when the com drops below 0.75 / 0.65 / 0.6 m above the ground
-  ("fell over"). The obstacle stages follow in step 5.
+  ("fell over"); 0.4 m on obstacle courses, 0.25 m once walls with low holes
+  appear. The obstacle stages start at difficulty 0 and raise it by 0.1 whenever
+  60% of the last 300 runs finished. Half of their runs start in front of a
+  random obstacle, so the later obstacles of a course get as much practice as
+  the first; the time limit is 10 s + 1.5 s per metre of course.
 
 **On GitHub** ([`.github/workflows/train.yml`](.github/workflows/train.yml)):
 Actions → *train* → *Run workflow* (or `gh workflow run train.yml`). A round
@@ -218,5 +227,5 @@ scripts/       dependency setup, checkpoint download
 1. ~~Humanoid, joint limits, injuries, sensors, viewer~~
 2. ~~Procedural obstacle course generator + route scoring~~
 3. ~~Perception of the surroundings (rays reporting obstacle type and surface angle, next obstacles)~~
-4. ~~Training (PPO) on GitHub runners: standing → walking → running~~ (pipeline done, training running)
-5. Stairs, platforms, hurdles → wall holes → swing bars
+4. ~~Training (PPO) on GitHub runners: standing → walking → running~~
+5. Stairs, platforms, hurdles → beams → wall holes → swing bars (training running)

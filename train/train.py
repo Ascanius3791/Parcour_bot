@@ -55,7 +55,7 @@ class Trainer:
         torch.manual_seed(args.seed)
         self.rng = np.random.default_rng(args.seed)
         self.state = {"stage": 0, "steps": 0, "stage_steps": 0, "iteration": 0, "hours": 0.0,
-                      "rounds": 0, "history": []}
+                      "rounds": 0, "history": [], "difficulty": None}
         ckpt = None
         if args.resume:
             path = args.resume if args.resume.endswith(".pt") else os.path.join(args.resume, "ckpt.pt")
@@ -69,6 +69,9 @@ class Trainer:
             new = stages.index(args.stage)
             if new != self.state["stage"]:
                 self.state["stage"], self.state["stage_steps"] = new, 0
+                self.state["difficulty"] = None
+        if self.state["difficulty"] is None:  # new stage (or a checkpoint from before the obstacle stages)
+            self.state["difficulty"] = self.stage["course"]["difficulty"]
         self.state["rounds"] += 1
 
         self.env = self.make_env()
@@ -91,7 +94,7 @@ class Trainer:
 
     def make_env(self):
         seed = (self.args.seed * 1_000_003 + self.state["iteration"] * 7919 + 1) % (1 << 62)
-        cfg = stages.make_config(self.stage, seed)
+        cfg = stages.make_config(self.stage, seed, self.state["difficulty"])
         return parcour.VecEnv(cfg, self.args.envs, self.args.threads)
 
     def observe(self, raw, update=True):
@@ -138,10 +141,22 @@ class Trainer:
         return bool(h) and h[-1]["stage"] == self.stage["name"]
 
     def check_goal(self):
-        """Records the stage goal once it holds and moves on to the next stage (returns True then)."""
-        if self.state["stage_steps"] < stages.MIN_STEPS or len(self.window) < stages.WINDOW or self.goal_done():
+        """Raises the difficulty of an obstacle stage once enough runs finish, records the stage
+        goal once it holds and moves on to the next stage. Returns True when the env changed."""
+        if self.goal_done():  # resumed after reaching the goal: a stage may have been added since
+            return self.next_stage()
+        if self.state["stage_steps"] < stages.MIN_STEPS or len(self.window) < stages.WINDOW:
             return False
         m = stages.episode_metrics(list(self.window))
+        ramp = self.stage.get("ramp")
+        if ramp is not None and self.state["difficulty"] < ramp - 1e-9:
+            if m.get("finish_rate", 0.0) < stages.RAMP_FINISH:
+                return False
+            self.state["difficulty"] = round(min(ramp, self.state["difficulty"] + stages.RAMP_STEP), 3)
+            print(f"*** {100 * m['finish_rate']:.0f}% finished: difficulty {self.state['difficulty']:g}", flush=True)
+            self.window.clear()
+            self.env = self.make_env()
+            return True
         if not stages.goal_reached(self.stage, m):
             return False
         self.state["history"].append({"stage": self.stage["name"], "steps": self.state["steps"],
@@ -151,8 +166,14 @@ class Trainer:
         if self.state["stage"] + 1 >= len(stages.STAGES):
             print("*** that was the last stage; training continues to improve it", flush=True)
             return False
+        return self.next_stage()
+
+    def next_stage(self):
+        if self.state["stage"] + 1 >= len(stages.STAGES):
+            return False
         self.state["stage"] += 1
         self.state["stage_steps"] = 0
+        self.state["difficulty"] = self.stage["course"]["difficulty"]
         self.window.clear()
         self.env = self.make_env()
         print(f"*** next stage '{self.stage['name']}': {self.stage['about']}", flush=True)
@@ -163,9 +184,11 @@ class Trainer:
         os.makedirs(args.out, exist_ok=True)
         start = last_save = time.time()
         deadline = start + args.minutes * 60
+        self.check_goal()  # a resumed run whose goal was reached moves on right away
         obs = self.observe(self.env.reset())
         log_eps, log_stats, log_t, log_steps = [], [], time.time(), 0
-        print(f"stage '{self.stage['name']}' ({self.stage['about']}), {self.env.num_envs} envs on "
+        print(f"stage '{self.stage['name']}' ({self.stage['about']}), difficulty {self.state['difficulty']:g}, "
+              f"{self.env.num_envs} envs on "
               f"{self.env.threads} threads, obs {self.env.obs_size}, actions {self.env.act_size}", flush=True)
         while time.time() < deadline:
             obs, batch, episodes = self.rollout(obs)
@@ -203,7 +226,8 @@ class Trainer:
     def log_row(self, episodes, stats, sps):
         m = stages.episode_metrics(episodes)
         row = {"hours": round(self.state["hours"], 4), "steps": self.state["steps"],
-               "stage": self.stage["name"], "iteration": self.state["iteration"], "sps": round(sps)}
+               "stage": self.stage["name"], "difficulty": self.state["difficulty"],
+               "iteration": self.state["iteration"], "sps": round(sps)}
         keys = ["episodes", "return", "seconds", "survival", "progress", "finish_rate", "speed"]
         keys += ["end:" + r for r in parcour.end_reasons[1:]]
         for k in keys:
@@ -213,12 +237,18 @@ class Trainer:
         for k in ("kl", "value_loss", "entropy"):
             row[k] = round(sum(s[k] for s in stats) / len(stats), 5)
         path = os.path.join(self.args.out, "metrics.csv")
-        new = not os.path.exists(path)
-        with open(path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(row))
-            if new:
+        old = []
+        if os.path.exists(path):
+            with open(path, newline="") as f:
+                old = list(csv.DictReader(f))
+        if old and list(old[0]) == list(row):
+            with open(path, "a", newline="") as f:
+                csv.DictWriter(f, fieldnames=list(row)).writerow(row)
+        else:  # new file, or columns added since: rewrite it with the current columns
+            with open(path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(row), restval="", extrasaction="ignore")
                 w.writeheader()
-            w.writerow(row)
+                w.writerows(old + [row])
         print(f"{row['hours']:6.2f} h {row['steps'] / 1e6:8.2f} M steps {row['sps']:5d}/s  {row['stage']:6s} "
               f"return {row['return']:7.2f}  ep {row['seconds']:5.1f} s  progress {row['progress']:5.1f} m  "
               f"finished {row['finish_rate']:.2f}  speed {row['speed']:.2f}  std {row['std']:.3f}  "
@@ -228,7 +258,8 @@ class Trainer:
         st = self.stage
         meta = {"stage": st["name"], "steps": self.state["steps"], "hours": round(self.state["hours"], 2)}
         for k, v in st["course"].items():
-            meta["course_" + k] = v
+            meta["course_" + k] = ",".join(v) if isinstance(v, list) else v
+        meta["course_difficulty"] = self.state["difficulty"]
         meta["env_time_limit"] = st["env"].get("time_limit", 0)
         meta["env_down_height"] = st["env"].get("down_height", 0)
         return meta
@@ -243,11 +274,12 @@ class Trainer:
 
     def evaluate(self):
         """Deterministic policy, one episode on each of eval_envs fixed courses of the current stage."""
-        cfg = stages.make_config(self.stage, EVAL_SEED)
+        cfg = stages.make_config(self.stage, EVAL_SEED, self.state["difficulty"])
+        cfg.random_start = 0
         env = parcour.VecEnv(cfg, self.args.eval_envs, self.args.threads)
         obs = env.reset()
         first = {}
-        max_steps = int(self.stage["env"].get("time_limit", 120) / 0.02) + 10
+        max_steps = int((self.stage["env"].get("time_limit") or 200) / 0.02) + 10
         for _ in range(max_steps):
             with torch.no_grad():
                 act = self.model.actor(self.observe(obs, update=False))
@@ -257,15 +289,17 @@ class Trainer:
             if len(first) == env.num_envs:
                 break
         m = stages.episode_metrics(list(first.values()))
-        return {"stage": self.stage["name"], "stage_index": self.state["stage"], "steps": self.state["steps"],
+        return {"stage": self.stage["name"], "stage_index": self.state["stage"],
+                "difficulty": self.state["difficulty"], "steps": self.state["steps"],
                 "hours": self.state["hours"], "goal_reached": stages.goal_reached(self.stage, m),
                 "metrics": m}
 
     def write_summary(self, result):
         st, s = self.stage, self.state
         m = result["metrics"]
+        level = f", difficulty {s['difficulty']:g}" if "ramp" in st else ""
         lines = [f"## Parcour bot training, round {s['rounds']}", "",
-                 f"**Stage {s['stage'] + 1} of {len(stages.STAGES)}: {st['name']}** ({st['about']}). "
+                 f"**Stage {s['stage'] + 1} of {len(stages.STAGES)}: {st['name']}** ({st['about']}{level}). "
                  f"Goal: {stages.describe_goal(st)}.", "",
                  f"Trained so far: {s['steps'] / 1e6:.1f} M steps in {s['hours']:.1f} h "
                  f"({s['steps'] * 0.02 / 3600:.1f} h of simulated time).", ""]
@@ -294,8 +328,10 @@ class Trainer:
                         next_h = float(r["hours"]) + 0.5
                 if pick[-1] is not rows[-1]:
                     pick.append(rows[-1])
+                ramped = {x["name"] for x in stages.STAGES if "ramp" in x}
                 for r in pick:
-                    lines.append(f"| {float(r['hours']):.1f} | {int(r['steps']) / 1e6:.1f} | {r['stage']} | "
+                    stage = r["stage"] + (f" {float(r['difficulty']):g}" if r["stage"] in ramped else "")
+                    lines.append(f"| {float(r['hours']):.1f} | {int(r['steps']) / 1e6:.1f} | {stage} | "
                                  f"{float(r['return']):.1f} | {float(r['seconds']):.1f} | {float(r['progress']):.1f} | "
                                  f"{100 * float(r['finish_rate']):.0f}% | {float(r['speed']):.2f} |")
         with open(os.path.join(self.args.out, "summary.md"), "w") as f:

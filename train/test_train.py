@@ -28,6 +28,12 @@ def run(out, extra):
     return t
 
 
+for st in train.stages.STAGES:
+    names = st["course"].get("allowed")
+    if names:
+        got = train.stages.make_config(st, 1).course.allowed
+        check(sorted(got) == sorted(names), f"stage {st['name']}: obstacle names are known")
+
 with tempfile.TemporaryDirectory() as tmp:
     a, b = os.path.join(tmp, "a"), os.path.join(tmp, "b")
     t = run(a, [])

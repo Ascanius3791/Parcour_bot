@@ -55,19 +55,20 @@ void ParkourEnv::reset(double lift, double start_s) {
     new_course(p);
   }
   ++episodes_on_course_;
-  if (start_s < 0) start_s = cfg_.start_s;
+  if (start_s < 0) {
+    start_s = cfg_.start_s;
+    const int obstacles = int(course_.sections.size()) - 2;  // between the start and finish runways
+    if (obstacles > 0 && cfg_.random_start > 0 && uniform() < cfg_.random_start) {
+      start_s = course_.sections[1 + std::min(obstacles - 1, int(uniform() * obstacles))].s0 + 0.5;
+    }
+  }
   const Section& start = course_.sections[course_.section_at(start_s)];
   sim_->reset_at(start.to_world(start_s - start.s0, 0, start.level_in), start.yaw, lift);
   if (cfg_.init_noise > 0) {
     const mjModel* m = sim_->model();
     mjData* d = sim_->data();
     for (int j : sim_->layout().actuated_joints) {
-      // splitmix64 -> uniform in [-1, 1)
-      uint64_t z = (noise_state_ += 0x9E3779B97F4A7C15ull);
-      z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-      z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-      z ^= z >> 31;
-      const double u = double(z >> 11) * 0x1.0p-52 - 1.0;
+      const double u = 2 * uniform() - 1;
       double& q = d->qpos[m->jnt_qposadr[j]];
       q = std::clamp(q + cfg_.init_noise * u, m->jnt_range[2 * j], m->jnt_range[2 * j + 1]);
     }
@@ -80,6 +81,14 @@ void ParkourEnv::reset(double lift, double start_s) {
   stall_since_ = 0;
   finish_time_ = 0;
   reason_ = EndReason::kNone;
+}
+
+double ParkourEnv::uniform() {  // splitmix64
+  uint64_t z = (noise_state_ += 0x9E3779B97F4A7C15ull);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  z ^= z >> 31;
+  return double(z >> 11) * 0x1.0p-53;
 }
 
 double ParkourEnv::time() const { return sim_->data()->time; }

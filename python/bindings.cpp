@@ -69,6 +69,7 @@ PYBIND11_MODULE(parcour, m) {
       .def_readwrite("course", &EnvConfig::course)
       .def_readwrite("episodes_per_course", &EnvConfig::episodes_per_course)
       .def_readwrite("start_s", &EnvConfig::start_s)
+      .def_readwrite("random_start", &EnvConfig::random_start)
       .def_readwrite("action_mode", &EnvConfig::action_mode)
       .def_readwrite("init_noise", &EnvConfig::init_noise)
       .def_readwrite("fall_depth", &EnvConfig::fall_depth)

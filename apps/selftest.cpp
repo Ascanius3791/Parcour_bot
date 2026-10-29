@@ -522,6 +522,30 @@ void test_training_interface(int threads) {
           fmt("(max %.3f rad)", max_dev));
   }
   {
+    // random starts: on the approach of every obstacle, standing, roughly half of the time
+    EnvConfig cfg;
+    cfg.course.num_obstacles = 4;
+    cfg.course.difficulty = 0.5;
+    cfg.random_start = 0.5;
+    cfg.episodes_per_course = 1 << 30;
+    ParkourEnv env(cfg);
+    const int sections = int(env.course().sections.size());
+    std::vector<int> count(sections, 0);
+    bool standing = true;
+    const int n = 200;
+    for (int k = 0; k < n; ++k) {
+      env.reset();
+      const int sec = env.section();
+      ++count[sec];
+      const double above = env.height_above_ground();
+      standing &= sec < sections - 1 && above > 0.85 && above < 1.05;
+    }
+    bool all = true;
+    for (int s = 1; s < sections - 1; ++s) all &= count[s] > 0;
+    check(standing && all && count[0] > 0.35 * n && count[0] < 0.65 * n,
+          "random starts: standing in front of every obstacle", fmt("(%.0f of %.0f at the start)", count[0], n));
+  }
+  {
     // the batch gives the same results on any number of threads
     EnvConfig cfg = track_config();
     cfg.time_limit = 0.5;  // many episode ends

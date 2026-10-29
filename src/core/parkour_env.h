@@ -19,6 +19,7 @@ struct EnvConfig {
   CourseParams course;           // course.seed is the seed of the first course
   int episodes_per_course = 8;   // compiling a course takes ~20 ms, so reuse it a few times
   double start_s = 1.0;          // start position along the route
+  double random_start = 0;       // chance that an episode starts in front of a random obstacle
   ActionMode action_mode = ActionMode::kTarget;
   double init_noise = 0;         // random offset of every joint angle at reset (rad)
 
@@ -57,7 +58,8 @@ class ParkourEnv {
   ParkourEnv& operator=(const ParkourEnv&) = delete;
 
   // Starts a new episode; generates the next course every episodes_per_course episodes.
-  // start_s < 0 uses config().start_s; it must lie on flat floor (a runway or an approach).
+  // start_s < 0 uses config().start_s, or with chance config().random_start the approach of a
+  // random obstacle; it must lie on flat floor (a runway or an approach).
   void reset(double lift = 0.0, double start_s = -1);
   // Switches to a specific course now (the next reset() starts on it).
   void new_course(const CourseParams& params);
@@ -101,6 +103,8 @@ class ParkourEnv {
   Course course_;
   int first_geom_ = -1;
   Perception perception_;
+  double uniform();  // in [0, 1), from noise_state_
+
   int episodes_on_course_ = 0;
   uint64_t next_seed_ = 0;
   uint64_t noise_state_ = 0;

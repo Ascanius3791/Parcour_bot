@@ -19,7 +19,7 @@ on:
         description: "training minutes per round"
         default: "315"
       stage:
-        description: "force a stage (stand / walk / run); empty = continue"
+        description: "force a stage (stand / walk / run / terrain / beam / wall / bars / parkour); empty = continue"
         default: ""
       fresh:
         description: "start from scratch instead of the newest checkpoint"
