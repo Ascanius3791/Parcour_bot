@@ -1,7 +1,7 @@
 // Interactive 3D viewer for the parkour humanoid.
 // Usage: parcour_viewer [--policy policy.bin] [--seed N] [--difficulty D] [--obstacles N]
 //                       [--track LENGTH] [--section K] [--overview] [--vision]
-//                       [--screenshot out.ppm --at SECONDS]
+//                       [--pretty] [--gpu] [--screenshot out.ppm --at SECONDS]
 //        parcour_viewer scene.xml        (a fixed scene instead of generated courses)
 //
 // Shows the body, its centre of mass, momentum and angular momentum, and colours every
@@ -9,7 +9,12 @@
 // courses it also shows the route, progress, how the run ended and what the bot perceives
 // (rays coloured by obstacle type, upcoming obstacles). With --policy it runs a trained policy
 // (from train/) on the course it was trained for, unless --obstacles / --track / --difficulty
-// say otherwise. Press H for the key list.
+// say otherwise, and keeps going by itself: after a fall it continues at the next obstacle,
+// after the finish on the next course (A toggles this). Press H for the key list.
+//
+// Graphics: shadows and reflections are off unless --pretty (or F). Under WSL the GPU driver
+// is far slower than software rendering at presenting frames (~1 fps), so the viewer renders
+// in software there unless --gpu is given or LIBGL_ALWAYS_SOFTWARE / GALLIUM_DRIVER is set.
 
 #include <GLFW/glfw3.h>
 
@@ -17,7 +22,9 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -50,6 +57,9 @@ struct App {
   bool grip = false, invincible = false;
   bool show_com = true, show_limbs = false, show_stress = true, show_help = false;
   bool tracking = true, show_route = true, show_vision = false;
+  bool pretty = false, software_gl = false;
+  bool autoplay = false;   // policy mode: continue by itself after an episode ends
+  double ended_at = -1;    // wall time the current episode ended, -1 while it runs
   std::vector<float> obs;  // policy input, recomputed every frame for the vision overlay
   std::unique_ptr<Policy> policy;
   std::vector<float> policy_obs;
@@ -65,25 +75,57 @@ struct App {
   double sim_wall_offset = 0;
   double last_wall = 0;
   double rtf = 0;
+  double frame_time = 1.0 / 60;  // wall seconds per frame, smoothed
 };
 
 App app;
 
 const char* kHelp =
-    "Space\nRight\nBackspace\nD\nM\nG\nI\nC\nL\nS\nT\n+ / -\n"
+    "Space\nRight\nBackspace\nD\nM\nA\nG\nI\nC\nL\nS\nT\nF\n+ / -\n"
     "N / P\n[ / ]\nJ / K\nR\nY\nV\n"
     "Dbl-click\nCtrl+L drag\nCtrl+R drag\nH";
 const char* kHelpText =
     "pause / run\nsingle step (paused)\nreset at start\ndrop from height\n"
-    "mode: limp / hold pose / policy\ngrip on / off\ninvincible (no breaking)\ncom + momentum\n"
-    "per-limb momentum\nstress colours\ntrack camera\ndrop height\n"
+    "mode: limp / hold pose / policy\nautoplay (policy: keep going)\ngrip on / off\n"
+    "invincible (no breaking)\ncom + momentum\n"
+    "per-limb momentum\nstress colours\ntrack camera\nshadows + reflections (slower)\n"
+    "drop height\n"
     "next / previous course\ndifficulty - / +\nstart at next / previous obstacle\n"
     "route + progress\nvision: rays + next obstacles\ncourse overview camera\n"
     "select body\nrotate body\npull body\nhelp";
 
+// WSL's GPU OpenGL driver renders fast but takes ~0.25 s to present each frame.
+bool running_on_wsl() {
+  if (std::getenv("WSL_DISTRO_NAME")) return true;
+  std::ifstream f("/proc/sys/kernel/osrelease");
+  std::string release;
+  std::getline(f, release);
+  for (char& ch : release) ch = char(std::tolower(ch));
+  return release.find("microsoft") != std::string::npos;
+}
+
+void apply_graphics() {
+  app.scn.flags[mjRND_SHADOW] = app.pretty;
+  app.scn.flags[mjRND_REFLECTION] = app.pretty;
+  app.scn.flags[mjRND_SKYBOX] = app.pretty;
+}
+
+// (Re)creates the scene and GPU resources for the current model.
+void make_render_context() {
+  const mjModel* m = app.sim->model();
+  // a smaller shadow map keeps software rendering with shadows bearable (visual setting only)
+  if (app.software_gl) const_cast<mjModel*>(m)->vis.quality.shadowsize = 1024;
+  mjv_freeScene(&app.scn);
+  mjv_makeScene(m, &app.scn, 4000);
+  mjr_freeContext(&app.con);
+  mjr_makeContext(m, &app.con, mjFONTSCALE_150);
+  apply_graphics();
+}
+
 void reset(double lift) {
   if (app.env) app.env->reset(lift, app.start_s);
   else app.sim->reset(lift);
+  app.ended_at = -1;
   app.substeps = 0;
   app.sim_wall_offset = glfwGetTime() - app.sim->data()->time;
   mjv_defaultPerturb(&app.pert);
@@ -93,11 +135,7 @@ void reset(double lift) {
 // Builds the course in app.course and rebuilds everything that depends on the model.
 void load_course() {
   app.env->new_course(app.course);
-  const mjModel* m = app.sim->model();
-  mjv_freeScene(&app.scn);
-  mjv_makeScene(m, &app.scn, 4000);
-  mjr_freeContext(&app.con);
-  mjr_makeContext(m, &app.con, mjFONTSCALE_150);
+  make_render_context();
   app.start_s = -1;
   reset(0.0);
   app.paused = false;
@@ -135,12 +173,43 @@ void jump_section(int dir) {
   app.paused = false;
 }
 
+// Seconds the result of an episode stays on screen before autoplay moves on.
+constexpr double kAutoplayPause = 2.0;
+
+bool episode_over() {
+  return app.sim->injury().broken_segment() >= 0 || app.env->end_reason() != EndReason::kNone;
+}
+
+// Autoplay: once an episode is over, continue at the obstacle after the one that ended it,
+// or on the next course after the finish (or when no obstacle is left).
+void autoplay() {
+  if (!app.autoplay || !app.env || app.mode != Mode::kPolicy) return;
+  if (!episode_over()) {
+    app.ended_at = -1;
+    return;
+  }
+  const double wall = glfwGetTime();
+  if (app.ended_at < 0) app.ended_at = wall;
+  if (wall - app.ended_at < kAutoplayPause) return;
+  const Course& c = app.env->course();
+  const int next = c.section_at(app.env->best_progress()) + 1;
+  if (!app.env->finished() && next < int(c.sections.size())) {
+    app.start_s = c.sections[next].s0 + 0.5;
+    reset(0.0);
+    app.paused = false;
+  } else {
+    ++app.course.seed;
+    load_course();
+  }
+}
+
 void apply_controller() {
   const mjModel* m = app.sim->model();
   mjData* d = app.sim->data();
   if (app.mode == Mode::kPolicy) {
     // same timing as training: observe and act at the control rate, PD on every substep
     if (app.substeps % app.sim->frame_skip == 0) {
+      app.env->evaluate();  // detect the end of the episode at the control rate, as in training
       app.env->observe(app.policy_obs);
       app.policy->act(app.policy_obs, app.action.data());
     }
@@ -169,7 +238,8 @@ void physics() {
   }
   const double t0 = d->time;
   const double target = app.step_once ? d->time + m->opt.timestep : wall - app.sim_wall_offset;
-  const double budget_end = wall + 1.0 / 30;  // keep the UI responsive if we fall behind
+  // keep the UI responsive if we fall behind, but let slow-rendering frames still keep up
+  const double budget_end = wall + std::max(1.0 / 30, 0.5 * app.frame_time);
   while (d->time < target && glfwGetTime() < budget_end) {
     mju_zero(d->xfrc_applied, 6 * m->nbody);
     mjv_applyPerturbPose(m, d, &app.pert, 0);
@@ -376,10 +446,11 @@ void overlay(mjrRect vp) {
                 "time\nspeed\nmode\ngrip\ncom height\ncom speed\n|momentum|\n|ang. momentum|\n"
                 "max stress");
   std::snprintf(right, sizeof(right),
-                "%.2f s%s\n%.2fx real time\n%s%s\n%s\n%.2f m\n%.2f m/s\n%.1f kg m/s\n"
+                "%.2f s%s\n%.2fx real time, %.0f fps\n%s%s%s\n%s\n%.2f m\n%.2f m/s\n%.1f kg m/s\n"
                 "%.2f kg m^2/s\n%.0f%% (%s)",
-                d->time, app.paused ? "  [paused]" : "", app.rtf,
+                d->time, app.paused ? "  [paused]" : "", app.rtf, 1.0 / app.frame_time,
                 mode_name().c_str(), app.invincible ? " (invincible)" : "",
+                app.mode == Mode::kPolicy && app.autoplay ? ", autoplay" : "",
                 app.grip ? "closed" : "open", s.com.z, s.com_vel.norm(), s.momentum.norm(),
                 s.ang_momentum.norm(), 100 * inj.loads()[worst].stress,
                 InjuryMonitor::joint_name(worst).c_str());
@@ -412,14 +483,28 @@ void overlay(mjrRect vp) {
   }
   mjr_overlay(mjFONT_NORMAL, mjGRID_TOPLEFT, vp, left, right, &app.con);
 
+  std::string next_hint;  // what autoplay does next
+  if (app.ended_at >= 0) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "next in %.0f s (A = stay)",
+                  std::ceil(std::max(0.0, kAutoplayPause - (glfwGetTime() - app.ended_at))));
+    next_hint = buf;
+  }
   if (inj.broken_segment() >= 0) {
     std::string msg = "JOINT BROKEN: " + InjuryMonitor::joint_name(inj.broken_segment());
-    mjr_overlay(mjFONT_BIG, mjGRID_TOP, vp, msg.c_str(),
-                app.invincible ? nullptr : "Backspace = reset, I = continue invincible", &app.con);
+    const char* sub = app.invincible ? nullptr : "Backspace = reset, I = continue invincible";
+    if (!next_hint.empty() || sub) msg += "\n" + (next_hint.empty() ? std::string(sub) : next_hint);
+    mjr_overlay(mjFONT_BIG, mjGRID_TOP, vp, msg.c_str(), nullptr, &app.con);
   } else if (app.env && app.env->end_reason() != EndReason::kNone) {
     std::string msg = end_reason_name(app.env->end_reason());
     for (char& ch : msg) ch = char(std::toupper(ch));
-    mjr_overlay(mjFONT_BIG, mjGRID_TOP, vp, msg.c_str(), "Backspace = restart", &app.con);
+    if (app.env->finished()) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), " in %.2f s", app.env->finish_time());
+      msg += buf;
+    }
+    msg += "\n" + (next_hint.empty() ? std::string("Backspace = restart") : next_hint);
+    mjr_overlay(mjFONT_BIG, mjGRID_TOP, vp, msg.c_str(), nullptr, &app.con);
   }
   if (app.show_help) {
     mjr_overlay(mjFONT_NORMAL, mjGRID_TOPRIGHT, vp, kHelp, kHelpText, &app.con);
@@ -446,6 +531,14 @@ void on_key(GLFWwindow*, int key, int, int act, int) {
       } else {
         app.mode = Mode::kLimp;
       }
+      break;
+    case GLFW_KEY_A:
+      app.autoplay = !app.autoplay;
+      app.ended_at = -1;
+      break;
+    case GLFW_KEY_F:
+      app.pretty = !app.pretty;
+      apply_graphics();
       break;
     case GLFW_KEY_G: app.grip = !app.grip; break;
     case GLFW_KEY_I:
@@ -571,6 +664,7 @@ int main(int argc, char** argv) {
   const char* policy_path = nullptr;
   bool course_given = false;
   double track = -1;
+  bool gpu = false;
   for (int i = 1; i < argc; ++i) {
     course_given |= !std::strcmp(argv[i], "--difficulty") || !std::strcmp(argv[i], "--obstacles") ||
                     !std::strcmp(argv[i], "--track");
@@ -584,6 +678,8 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--policy") && i + 1 < argc) policy_path = argv[++i];
     else if (!std::strcmp(argv[i], "--overview")) overview = true;
     else if (!std::strcmp(argv[i], "--vision")) app.show_vision = true;
+    else if (!std::strcmp(argv[i], "--pretty")) app.pretty = true;
+    else if (!std::strcmp(argv[i], "--gpu")) gpu = true;
     else path = argv[i];
   }
   if (track >= 0) app.course.num_obstacles = 0, app.course.finish_length = track;
@@ -622,17 +718,24 @@ int main(int argc, char** argv) {
       }
       app.action.assign(app.sim->model()->nu, 0.0);
       app.mode = Mode::kPolicy;
+      app.autoplay = true;
     }
   } else {
     app.fixed_scene = std::make_unique<Simulation>(path);
     app.sim = app.fixed_scene.get();
   }
 
+  if (!gpu && running_on_wsl() && !std::getenv("LIBGL_ALWAYS_SOFTWARE") && !std::getenv("GALLIUM_DRIVER") &&
+      !std::getenv("MESA_LOADER_DRIVER_OVERRIDE")) {
+    setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);  // must happen before the GL driver loads
+  }
+  const char* sw = std::getenv("LIBGL_ALWAYS_SOFTWARE");
+  app.software_gl = sw && std::strcmp(sw, "0") != 0 && std::strcmp(sw, "false") != 0;
   if (!glfwInit()) {
     std::fprintf(stderr, "could not initialise GLFW (is a display available?)\n");
     return 1;
   }
-  glfwWindowHint(GLFW_SAMPLES, 4);
+  glfwWindowHint(GLFW_SAMPLES, app.software_gl ? 0 : 4);  // multisampling is costly in software
   GLFWwindow* window = glfwCreateWindow(1400, 900, "Parcour bot", nullptr, nullptr);
   if (!window) {
     std::fprintf(stderr, "could not create window\n");
@@ -646,8 +749,7 @@ int main(int argc, char** argv) {
   mjv_defaultScene(&app.scn);
   mjr_defaultContext(&app.con);
   mjv_defaultPerturb(&app.pert);
-  mjv_makeScene(app.sim->model(), &app.scn, 4000);
-  mjr_makeContext(app.sim->model(), &app.con, mjFONTSCALE_150);
+  make_render_context();
 
   app.cam.type = mjCAMERA_TRACKING;
   app.cam.trackbodyid = app.sim->layout().root_body;
@@ -662,8 +764,10 @@ int main(int argc, char** argv) {
 
   reset(0.0);
   if (overview) overview_camera();
+  double frame_start = glfwGetTime();
   while (!glfwWindowShouldClose(window)) {
     physics();
+    autoplay();
     mjrRect vp = {0, 0, 0, 0};
     glfwGetFramebufferSize(window, &vp.width, &vp.height);
     mjv_updateScene(app.sim->model(), app.sim->data(), &app.opt, &app.pert, &app.cam, mjCAT_ALL,
@@ -677,6 +781,9 @@ int main(int argc, char** argv) {
     }
     glfwSwapBuffers(window);
     glfwPollEvents();
+    const double now = glfwGetTime();
+    app.frame_time = 0.9 * app.frame_time + 0.1 * std::min(now - frame_start, 1.0);
+    frame_start = now;
   }
 
   mjv_freeScene(&app.scn);

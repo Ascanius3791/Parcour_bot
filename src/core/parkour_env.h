@@ -87,6 +87,7 @@ class ParkourEnv {
   int section() const { return section_; }
   int sections_cleared() const;
   bool finished() const { return reason_ == EndReason::kFinished; }
+  double finish_time() const { return finish_time_; }  // episode time at the finish line
   EndReason end_reason() const { return reason_; }
   // Ranking score: metres reached, plus one point per second left when finished.
   double score() const;

@@ -29,12 +29,20 @@ Viewer options: `--policy file` (run a trained policy, on the kind of course it
 was trained on), `--seed N`, `--difficulty 0..1`, `--obstacles N`, `--track L`
 (no obstacles, L m of flat track), `--section K`
 (start at the K-th section), `--overview` (camera on the whole course),
-`--vision` (show what the bot perceives). Pass a
+`--vision` (show what the bot perceives), `--pretty` (shadows, reflections and
+sky; slower), `--gpu` (see below). Pass a
 scene file instead, e.g. `build/parcour_viewer assets/scene_flat.xml`, to get the
 plain floor.
 
+With a policy the viewer plays on by itself (autoplay, key A): after a fall it
+continues at the next obstacle, after the finish on the next course.
+
 The viewer needs a display (WSLg on Windows 11 works out of the box). Build
-without it via `-DPARCOUR_BUILD_VIEWER=OFF`.
+without it via `-DPARCOUR_BUILD_VIEWER=OFF`. Under WSL it renders in software:
+WSL's GPU OpenGL driver draws quickly but needs ~0.25 s to show each frame
+(about 1 fps), while software rendering manages 20-30 fps. `--gpu` keeps the GPU
+driver. The overlay shows the frame rate and whether the simulation keeps up
+with real time.
 
 ### Viewer controls
 
@@ -44,6 +52,8 @@ without it via `-DPARCOUR_BUILD_VIEWER=OFF`.
 | Backspace | reset standing |
 | D, + / - | drop from height (default 2 m), change height |
 | M | controller: limp, hold pose or the loaded policy |
+| A | autoplay: after the end of a run, continue at the next obstacle / course |
+| F | shadows, reflections and sky (slower) |
 | G | close / open both hands |
 | I | invincible (joints don't break) |
 | C / L / S | com + momentum arrows / per-limb momentum / stress colours |
